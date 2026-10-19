@@ -1,0 +1,4 @@
+#include <windows.h>
+
+101 RCDATA "assets/yt-dlp.exe"
+102 RCDATA "assets/yt-dlp-version.txt"

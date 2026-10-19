@@ -1,0 +1,12 @@
+diff --git a/api/cpp/Cargo.toml b/api/cpp/Cargo.toml
+index 291df09..c7baea9 100644
+--- a/api/cpp/Cargo.toml
++++ b/api/cpp/Cargo.toml
+@@ -55,7 +55,5 @@ std = [
+   "i-slint-core/default",
+   "i-slint-core/image-decoders",
+-  "i-slint-core/svg",
+-  "i-slint-core/image-default-formats",
+   "i-slint-backend-selector",
+   "i-slint-backend-selector/backend-android-activity",
+   "i-slint-renderer-software?/std",

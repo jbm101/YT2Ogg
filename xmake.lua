@@ -29,6 +29,9 @@ target("YT2Ogg")
     elseif is_plat("linux") then
         add_includedirs("/usr/include/slint")
     end
+    if is_plat("windows") then
+        add_includedirs("build/slint-generated", {tools = {"gcc"}})
+    end
     if slint_library_dir then
         add_linkdirs(slint_library_dir)
     elseif is_plat("linux") then
@@ -44,9 +47,19 @@ target("YT2Ogg")
         add_cxflags("-flto=thin")
         add_ldflags("-Wl,-dead_strip", "-Wl,-dead_strip_dylibs", "-Wl,-S")
     elseif is_plat("windows") then
-        add_syslinks("shell32", "ole32")
-        add_cxflags("/GL", "/Gy", "/Zl")
-        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF")
+        add_syslinks("shell32", "ole32", "uuid", "ws2_32", "ntdll", "uxtheme", "imm32")
+        add_cxflags("-ffunction-sections", "-fdata-sections", {tools = {"gcc"}})
+        add_cxflags("-include", "src/slint-static/disable_import.h",
+                    {tools = {"gcc"}, force = true})
+        add_ldflags("-Wl,--gc-sections", "-static", "-static-libgcc",
+                    "-static-libstdc++", "-mwindows", {tools = {"gcc"}})
+        add_cxflags("/GL", "/Gy", "/Zl", {tools = {"cl", "clang_cl"}})
+        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF", "/SUBSYSTEM:WINDOWS",
+                    {tools = {"cl", "clang_cl"}})
+        set_runtimes("MT")
+        if os.isfile("assets/yt-dlp.exe") and os.isfile("assets/yt-dlp-version.txt") then
+            add_files("src/yt-dlp.rc")
+        end
     end
     
     set_optimize("smallest")

@@ -46,11 +46,32 @@ xmake
 xmake package-yt2ogg
 ```
 
-### macOS and Windows
+### macOS
 
 Install xmake and the Slint C++ SDK for your platform. Put `slint-compiler` on `PATH`; if the SDK
 is not installed in a standard location, set `SLINT_INCLUDE_DIR` to its `include/slint` directory
 and `SLINT_LIBRARY_DIR` to its library directory. Then run `xmake`.
+
+### Standalone Windows executable (built on Linux)
+
+Run this from the project directory on Linux:
+
+```bash
+./scripts/compile-windows.sh
+```
+
+Install xmake, MinGW-w64, Rust with `rustup`, and the Linux Slint C++ SDK/compiler matching the
+project. The build adds the Rust Windows target, builds Slint's static Windows runtime from the
+matching Slint release, then cross-compiles the application. The Linux Slint package supplies the
+host `slint-compiler`; its Linux runtime library is not linked into the Windows application.
+
+The command checks the latest yt-dlp GitHub release, updates the ignored `assets/yt-dlp.exe` only
+when needed, and creates `build/windows/x64/release/YT2Ogg.exe`. The Windows Slint runtime and
+yt-dlp are statically linked or embedded in that executable; yt-dlp is extracted to the user's
+local application data directory at runtime. The finished executable is stripped and compressed
+with UPX; install UPX on the Linux build machine. The Windows runtime is built with Rust's
+size-focused optimization and omits Slint's unused SVG and default image-format support (the app's
+UI has no image assets).
 
 ## Usage
 

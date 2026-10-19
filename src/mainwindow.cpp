@@ -15,7 +15,9 @@
 #include <vector>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <shellapi.h>
 #include <shobjidl.h>
@@ -38,6 +40,93 @@ extern char **environ;
 
 namespace {
 constexpr std::size_t MaxConcurrentDownloads = 3;
+
+#ifdef _WIN32
+std::optional<std::filesystem::path> extractBundledYtDlp(std::string &error_message) {
+    const HMODULE module = GetModuleHandleW(nullptr);
+    const auto resource_type = MAKEINTRESOURCEW(10);
+    const HRSRC executable_resource = FindResourceW(
+        module, MAKEINTRESOURCEW(101), resource_type);
+    const HRSRC version_resource = FindResourceW(
+        module, MAKEINTRESOURCEW(102), resource_type);
+    if (!executable_resource || !version_resource) return std::nullopt;
+
+    const HGLOBAL version_data = LoadResource(module, version_resource);
+    const DWORD version_size = SizeofResource(module, version_resource);
+    const auto *version_bytes = static_cast<const char *>(LockResource(version_data));
+    if (!version_data || !version_bytes || version_size == 0) {
+        error_message = "Could not read the bundled yt-dlp version.";
+        return std::nullopt;
+    }
+
+    std::string version(version_bytes, version_size);
+    while (!version.empty() && (version.back() == '\r' || version.back() == '\n')) {
+        version.pop_back();
+    }
+    if (version.empty() || !std::all_of(version.begin(), version.end(), [](unsigned char c) {
+            return (c >= '0' && c <= '9') || c == '.';
+        })) {
+        error_message = "The bundled yt-dlp version is invalid.";
+        return std::nullopt;
+    }
+
+    const DWORD directory_size = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
+    if (directory_size == 0) {
+        error_message = "Could not locate the local application data directory.";
+        return std::nullopt;
+    }
+    std::wstring local_app_data(directory_size, L'\0');
+    const DWORD directory_length = GetEnvironmentVariableW(
+        L"LOCALAPPDATA", local_app_data.data(), directory_size);
+    if (directory_length == 0 || directory_length >= directory_size) {
+        error_message = "Could not read the local application data directory.";
+        return std::nullopt;
+    }
+    local_app_data.resize(directory_length);
+
+    std::wstring wide_version(version.begin(), version.end());
+    const auto executable_path = std::filesystem::path(local_app_data) / L"YT2Ogg" /
+        (L"yt-dlp-" + wide_version + L".exe");
+    std::error_code filesystem_error;
+    if (std::filesystem::is_regular_file(executable_path, filesystem_error) &&
+        std::filesystem::file_size(executable_path, filesystem_error) > 0) {
+        return executable_path;
+    }
+
+    const auto executable_data = LoadResource(module, executable_resource);
+    const DWORD executable_size = SizeofResource(module, executable_resource);
+    const auto *executable_bytes = static_cast<const char *>(LockResource(executable_data));
+    if (!executable_data || !executable_bytes || executable_size == 0) {
+        error_message = "Could not read the bundled yt-dlp executable.";
+        return std::nullopt;
+    }
+
+    std::filesystem::create_directories(executable_path.parent_path(), filesystem_error);
+    if (filesystem_error) {
+        error_message = "Could not create the yt-dlp application data directory.";
+        return std::nullopt;
+    }
+    auto temporary_path = executable_path;
+    temporary_path += L".tmp";
+    {
+        std::ofstream output(temporary_path, std::ios::binary | std::ios::trunc);
+        output.write(executable_bytes, static_cast<std::streamsize>(executable_size));
+        output.close();
+        if (!output) {
+            std::filesystem::remove(temporary_path, filesystem_error);
+            error_message = "Could not write the bundled yt-dlp executable.";
+            return std::nullopt;
+        }
+    }
+    if (!MoveFileExW(temporary_path.c_str(), executable_path.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::filesystem::remove(temporary_path, filesystem_error);
+        error_message = "Could not install the bundled yt-dlp executable.";
+        return std::nullopt;
+    }
+    return executable_path;
+}
+#endif
 
 slint::SharedString toSlintString(std::string_view value) {
     return slint::SharedString(value);
@@ -509,6 +598,18 @@ void MainWindow::startDownload(std::uint64_t download_id) {
     const int index = findDownloadIndex(download_id);
     if (index < 0) return;
 
+#ifdef _WIN32
+    std::string extraction_error;
+    const auto bundled_ytdlp_path = extractBundledYtDlp(extraction_error);
+    if (!extraction_error.empty()) {
+        auto &info = download_history_[static_cast<std::size_t>(index)];
+        info.status = 3;
+        info.progress = "Failed: " + extraction_error;
+        refreshHistory();
+        return;
+    }
+#endif
+
     DownloadInfo info = std::move(download_history_[static_cast<std::size_t>(index)]);
     download_history_.erase(download_history_.begin() + index);
     info.status = 1;
@@ -517,11 +618,11 @@ void MainWindow::startDownload(std::uint64_t download_id) {
     download_history_.insert(download_history_.begin(), std::move(info));
     refreshHistory();
 
-    auto ytdlp_path = executable_path_.parent_path() /
 #ifdef _WIN32
-        "yt-dlp.exe";
+    auto ytdlp_path = executable_path_.parent_path() / "yt-dlp.exe";
+    if (bundled_ytdlp_path) ytdlp_path = *bundled_ytdlp_path;
 #else
-        "yt-dlp";
+    auto ytdlp_path = executable_path_.parent_path() / "yt-dlp";
 #endif
     std::error_code error;
     if (!std::filesystem::is_regular_file(ytdlp_path, error)) {
