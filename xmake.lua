@@ -37,15 +37,19 @@ target("YT2Ogg")
     add_links("slint_cpp")
     if is_plat("linux") then
         add_syslinks("pthread", "dl", "rt")
-        add_cxflags("-ffunction-sections", "-fdata-sections", "-fno-semantic-interposition", "-O3")
-        add_ldflags("-Wl,--gc-sections", "-Wl,-rpath,$ORIGIN")
+        add_cxflags("-flto", "-ffunction-sections", "-fdata-sections", "-fno-semantic-interposition", "-fno-ident")
+        add_ldflags("-flto", "-Wl,--gc-sections", "-Wl,--as-needed", "-Wl,--strip-all", "-Wl,-rpath,$ORIGIN")
     elseif is_plat("macos") then
         add_frameworks("Cocoa", "AppKit")
+        add_cxflags("-flto=thin")
+        add_ldflags("-Wl,-dead_strip", "-Wl,-dead_strip_dylibs", "-Wl,-S")
     elseif is_plat("windows") then
         add_syslinks("shell32", "ole32")
+        add_cxflags("/GL", "/Gy", "/Zl")
+        add_ldflags("/LTCG", "/OPT:REF", "/OPT:ICF")
     end
     
-    set_optimize("fastest")
+    set_optimize("smallest")
     set_symbols("none")
     
     set_installdir("@bindir")

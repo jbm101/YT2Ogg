@@ -117,7 +117,6 @@ std::optional<std::filesystem::path> chooseOutputDirectory(
 
     std::optional<std::filesystem::path> selected_directory;
     if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
-        // Closing the picker without choosing a folder is not an error.
     } else if (SUCCEEDED(result)) {
         IShellItem *selected_item = nullptr;
         result = dialog->GetResult(&selected_item);
