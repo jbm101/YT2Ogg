@@ -1,0 +1,39 @@
+# Build artifacts
+build/
+dist/
+.xmake/
+
+# Compiled binary
+YT2Ogg
+YT2Ogg.exe
+
+# Object files
+*.o
+
+# Qt MOC generated files
+moc_*.cpp
+moc_*.h
+moc_predefs.h
+
+# qmake
+*.pro.user
+.qmake.stash
+Makefile
+
+# IDE
+*.sln
+*.vcxproj
+*.xcodeproj/
+*.xcworkspace/
+*.idea/
+*.sublime-*
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# yt-dlp binaries (auto-downloaded at first run)
+yt-dlp
+yt-dlp.exe
