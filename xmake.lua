@@ -1,18 +1,11 @@
--- YT2Ogg - YouTube to Opus Converter
--- Cross-platform build with xmake
-
 set_xmakever("2.8.0")
 set_project("YT2Ogg")
 set_version("1.0.0")
 
 set_license("MIT")
 
--- Global options
 set_languages("c++26")
 
--- =====================
--- Main executable
--- =====================
 target("YT2Ogg")
     set_kind("binary")
 
@@ -28,7 +21,6 @@ target("YT2Ogg")
         target:add("includedirs", generated_dir)
     end)
     
-    -- Source files
     add_files("src/*.cpp")
     local slint_include_dir = os.getenv("SLINT_INCLUDE_DIR")
     local slint_library_dir = os.getenv("SLINT_LIBRARY_DIR")
@@ -43,7 +35,6 @@ target("YT2Ogg")
         add_linkdirs("/usr/lib")
     end
     add_links("slint_cpp")
-    -- Platform libraries
     if is_plat("linux") then
         add_syslinks("pthread", "dl", "rt")
         add_cxflags("-ffunction-sections", "-fdata-sections", "-fno-semantic-interposition", "-O3")
@@ -54,9 +45,7 @@ target("YT2Ogg")
         add_syslinks("shell32", "ole32")
     end
     
-    -- Compiler optimizations (release)
     set_optimize("fastest")
     set_symbols("none")
     
-    -- Install to bin/ alongside executable
     set_installdir("@bindir")

@@ -127,8 +127,9 @@ Downloads use numeric status codes for precise error tracking:
 
 ### Build Optimizations
 
+- **Size-focused optimization** using xmake's smallest optimization level
 - **Link-time optimization** (`/GL` on MSVC, `-flto` on GCC/Clang)
-- **Dead code elimination** (`-Wl,--gc-sections` on Linux)
+- **Dead code elimination and stripping** (`-Wl,--gc-sections` and `-Wl,--strip-all` on Linux)
 - **Stripped symbols** in release builds
 - Slint provides the complete GUI, uses its native widget style and palette, and is forced to dark mode. The downloader uses the C++ standard library and native process APIs; no Qt dependency is required.
 

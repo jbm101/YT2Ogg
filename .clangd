@@ -4,6 +4,7 @@ CompileFlags:
     - -std=c++26
     - -I/usr/include/slint
     - -Isrc
+    - -Ibuild/.gens/YT2Ogg/linux/x86_64/release/slint
   Remove:
     - -std=c++23
     - -std=c++20

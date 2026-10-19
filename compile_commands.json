@@ -1,0 +1,16 @@
+[
+{
+  "directory": "/home/jbm101/Documents/Projects/YT2Ogg",
+  "arguments": ["/usr/bin/g++", "-c", "-m64", "-std=c++26", "-I/usr/include/slint", "-ffunction-sections", "-fdata-sections", "-fno-semantic-interposition", "-O3", "-o", "build/.objs/YT2Ogg/linux/x86_64/release/src/main.cpp.o", "src/main.cpp"],
+  "file": "src/main.cpp"
+},
+{
+  "directory": "/home/jbm101/Documents/Projects/YT2Ogg",
+  "arguments": ["/usr/bin/g++", "-c", "-m64", "-std=c++26", "-I/usr/include/slint", "-ffunction-sections", "-fdata-sections", "-fno-semantic-interposition", "-O3", "-o", "build/.objs/YT2Ogg/linux/x86_64/release/src/downloadthread.cpp.o", "src/downloadthread.cpp"],
+  "file": "src/downloadthread.cpp"
+},
+{
+  "directory": "/home/jbm101/Documents/Projects/YT2Ogg",
+  "arguments": ["/usr/bin/g++", "-c", "-m64", "-std=c++26", "-I/usr/include/slint", "-ffunction-sections", "-fdata-sections", "-fno-semantic-interposition", "-O3", "-o", "build/.objs/YT2Ogg/linux/x86_64/release/src/mainwindow.cpp.o", "src/mainwindow.cpp"],
+  "file": "src/mainwindow.cpp"
+}]

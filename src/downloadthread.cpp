@@ -13,7 +13,6 @@
 #define NOMINMAX
 #include <windows.h>
 #else
-#include <cerrno>
 #include <csignal>
 #include <fcntl.h>
 #include <poll.h>

@@ -1,7 +1,6 @@
 #ifndef MAINWINDOW_H
 #define MAINWINDOW_H
 
-#include <chrono>
 #include <cstdint>
 #include <atomic>
 #include <filesystem>
@@ -31,9 +30,7 @@ private:
         std::string url;
         std::string title;
         std::filesystem::path file_path;
-        std::uintmax_t file_size = 0;
         int status = 0;
-        std::chrono::steady_clock::time_point start_time;
         std::string progress = "-";
         std::string speed = "-";
     };
@@ -55,7 +52,6 @@ private:
     void openFolder(int index);
     void removeItem(int index);
     static std::string formatFileSize(std::int64_t bytes);
-    static std::string formatDuration(int seconds);
 
     std::filesystem::path executable_path_;
     std::filesystem::path settings_path_;

@@ -38,7 +38,6 @@ extern char **environ;
 
 namespace {
 constexpr std::size_t MaxConcurrentDownloads = 3;
-constexpr std::int64_t SizeThreshold = 1024;
 
 slint::SharedString toSlintString(std::string_view value) {
     return slint::SharedString(value);
@@ -514,7 +513,6 @@ void MainWindow::startDownload(std::uint64_t download_id) {
     DownloadInfo info = std::move(download_history_[static_cast<std::size_t>(index)]);
     download_history_.erase(download_history_.begin() + index);
     info.status = 1;
-    info.start_time = std::chrono::steady_clock::now();
     info.progress = "-";
     info.speed = "-";
     download_history_.insert(download_history_.begin(), std::move(info));
@@ -632,20 +630,16 @@ void MainWindow::onDownloadFinished(DownloadThread *download, int status,
     const int index = findDownloadIndex(download_id);
     if (index >= 0) {
         DownloadInfo &info = download_history_[static_cast<std::size_t>(index)];
-        const int elapsed = static_cast<int>(
-            std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::steady_clock::now() - info.start_time).count());
         if (status == 0 && !file_path.empty()) {
             std::error_code error;
             info.status = 2;
             info.file_path = file_path;
-            info.file_size = std::filesystem::file_size(file_path, error);
-            info.progress = formatFileSize(static_cast<std::int64_t>(info.file_size));
+            info.progress = formatFileSize(static_cast<std::int64_t>(
+                std::filesystem::file_size(file_path, error)));
         } else {
             info.status = 3;
             info.progress = status == -2 ? "Cancelled" : "Failed";
         }
-        info.speed = formatDuration(elapsed);
     }
 
     download->join();
@@ -741,20 +735,11 @@ std::string MainWindow::formatFileSize(std::int64_t bytes) {
     constexpr std::array<const char *, 5> units = {"B", "KB", "MB", "GB", "TB"};
     std::size_t unit = 0;
     double size = static_cast<double>(bytes);
-    while (size >= SizeThreshold && unit < 4) {
-        size /= SizeThreshold;
+    while (size >= 1024 && unit < 4) {
+        size /= 1024;
         ++unit;
     }
     std::ostringstream output;
     output << std::fixed << std::setprecision(unit == 0 ? 0 : 1) << size << ' ' << units[unit];
     return output.str();
-}
-
-std::string MainWindow::formatDuration(int seconds) {
-    if (seconds < 60) return std::to_string(seconds) + "s";
-    if (seconds < 3600) {
-        return std::to_string(seconds / 60) + "m " + std::to_string(seconds % 60) + "s";
-    }
-    return std::to_string(seconds / 3600) + "h " +
-        std::to_string((seconds % 3600) / 60) + "m";
 }
