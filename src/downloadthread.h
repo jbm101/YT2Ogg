@@ -15,7 +15,7 @@ public:
         std::function<void(std::int64_t)> speed_changed;
         std::function<void(const std::string &)> status_changed;
         std::function<void(const std::string &)> title_found;
-        std::function<void(int, const std::filesystem::path &)> finished;
+        std::function<void(int, const std::filesystem::path &, const std::string &)> finished;
     };
 
     DownloadThread(std::string url, std::filesystem::path output_directory,
@@ -35,7 +35,8 @@ private:
     void run();
     void processLine(const std::string &line);
     bool parseProgressLine(const std::string &line);
-    void finish(int status, const std::filesystem::path &path = {});
+    void finish(int status, const std::filesystem::path &path = {},
+                const std::string &error_message = {});
 
     std::string url_;
     std::filesystem::path output_directory_;

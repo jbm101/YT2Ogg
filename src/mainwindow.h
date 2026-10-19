@@ -43,10 +43,11 @@ private:
     void startDownload(std::uint64_t download_id);
     void processDownloadQueue();
     void onDownloadFinished(DownloadThread *download, int status,
-                            const std::filesystem::path &file_path);
+                            const std::filesystem::path &file_path,
+                            const std::string &error_message);
     int findDownloadIndex(std::uint64_t download_id) const;
     void refreshHistory();
-    void refreshStatus(int last_status = -1);
+    void refreshStatus(int last_status = -1, const std::string &last_error = {});
     void updateDownloadButton();
     void openFile(int index);
     void openFolder(int index);

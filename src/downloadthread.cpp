@@ -4,6 +4,7 @@
 #include <array>
 #include <chrono>
 #include <cctype>
+#include <cstring>
 #include <regex>
 #include <string_view>
 #include <utility>
@@ -89,7 +90,8 @@ std::string quoteWindowsArgument(const std::wstring &argument) {
 }
 
 bool runProcess(const std::vector<std::string> &arguments, std::atomic_bool &cancelled,
-                const std::function<void(const std::string &)> &on_line, int &exit_code) {
+                const std::function<void(const std::string &)> &on_line, int &exit_code,
+                std::string &error_message) {
     std::wstring command_line;
     for (const std::string &argument : arguments) {
         if (!command_line.empty()) command_line.push_back(L' ');
@@ -99,7 +101,11 @@ bool runProcess(const std::vector<std::string> &arguments, std::atomic_bool &can
     SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
     HANDLE read_pipe = nullptr;
     HANDLE write_pipe = nullptr;
-    if (!CreatePipe(&read_pipe, &write_pipe, &security, 0)) return false;
+    if (!CreatePipe(&read_pipe, &write_pipe, &security, 0)) {
+        error_message = "Could not create a pipe for yt-dlp (Windows error " +
+            std::to_string(GetLastError()) + ").";
+        return false;
+    }
     SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOW startup{};
@@ -114,6 +120,8 @@ bool runProcess(const std::vector<std::string> &arguments, std::atomic_bool &can
                                         TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
     CloseHandle(write_pipe);
     if (!started) {
+        error_message = "Could not start yt-dlp (Windows error " +
+            std::to_string(GetLastError()) + ").";
         CloseHandle(read_pipe);
         return false;
     }
@@ -157,7 +165,10 @@ bool runProcess(const std::vector<std::string> &arguments, std::atomic_bool &can
     if (!buffered.empty()) on_line(buffered);
     WaitForSingleObject(process.hProcess, INFINITE);
     DWORD code = 1;
-    GetExitCodeProcess(process.hProcess, &code);
+    if (!GetExitCodeProcess(process.hProcess, &code)) {
+        error_message = "Could not read yt-dlp's exit code (Windows error " +
+            std::to_string(GetLastError()) + ").";
+    }
     exit_code = static_cast<int>(code);
     CloseHandle(read_pipe);
     CloseHandle(process.hThread);
@@ -166,7 +177,8 @@ bool runProcess(const std::vector<std::string> &arguments, std::atomic_bool &can
 }
 #else
 bool runProcess(const std::vector<std::string> &arguments, std::atomic_bool &cancelled,
-                const std::function<void(const std::string &)> &on_line, int &exit_code) {
+                const std::function<void(const std::string &)> &on_line, int &exit_code,
+                std::string &error_message) {
     int output_pipe[2];
     if (pipe(output_pipe) != 0) return false;
     posix_spawn_file_actions_t actions;
@@ -190,6 +202,7 @@ bool runProcess(const std::vector<std::string> &arguments, std::atomic_bool &can
                                           argv.data(), environ);
     posix_spawn_file_actions_destroy(&actions);
     if (spawn_status != 0) {
+        error_message = "Could not start yt-dlp: " + std::string(std::strerror(spawn_status));
         close(output_pipe[0]);
         close(output_pipe[1]);
         return false;
@@ -296,11 +309,19 @@ void DownloadThread::run() {
     });
 
     int exit_code = -1;
+    std::vector<std::string> diagnostic_lines;
+    std::string process_error;
     const bool started = runProcess(arguments, cancelled_,
-                                    [this](const std::string &line) { processLine(line); },
-                                    exit_code);
+        [this, &diagnostic_lines](const std::string &line) {
+            processLine(line);
+            if (!line.empty() && !line.starts_with("[download]") &&
+                !line.starts_with(TitleOutputPrefix) && !line.starts_with(FileOutputPrefix)) {
+                diagnostic_lines.push_back(line);
+                if (diagnostic_lines.size() > 6) diagnostic_lines.erase(diagnostic_lines.begin());
+            }
+        }, exit_code, process_error);
     if (!started) {
-        finish(-1);
+        finish(-1, {}, process_error);
         return;
     }
     if (cancelled_.load()) {
@@ -308,7 +329,17 @@ void DownloadThread::run() {
         return;
     }
     if (exit_code != 0) {
-        finish(-3);
+        if (process_error.empty() && !diagnostic_lines.empty()) {
+            for (const auto &line : diagnostic_lines) {
+                if (!process_error.empty()) process_error += " | ";
+                process_error += line;
+            }
+            if (process_error.size() > 600) process_error.resize(600);
+        }
+        if (process_error.empty()) {
+            process_error = "yt-dlp exited with code " + std::to_string(exit_code) + ".";
+        }
+        finish(-3, {}, process_error);
         return;
     }
 
@@ -386,6 +417,7 @@ bool DownloadThread::parseProgressLine(const std::string &line) {
     return true;
 }
 
-void DownloadThread::finish(int status, const std::filesystem::path &path) {
-    if (callbacks_.finished) callbacks_.finished(status, path);
+void DownloadThread::finish(int status, const std::filesystem::path &path,
+                            const std::string &error_message) {
+    if (callbacks_.finished) callbacks_.finished(status, path, error_message);
 }

@@ -67,8 +67,9 @@ host `slint-compiler`; its Linux runtime library is not linked into the Windows 
 
 The command checks the latest yt-dlp GitHub release, updates the ignored `assets/yt-dlp.exe` only
 when needed, and creates `build/windows/x64/release/YT2Ogg.exe`. The Windows Slint runtime and
-yt-dlp are statically linked or embedded in that executable; yt-dlp is extracted to the user's
-local application data directory at runtime. The finished executable is stripped and compressed
+yt-dlp are statically linked or embedded in that executable; yt-dlp is extracted to a versioned
+folder under the user's temporary directory at runtime. Downloader errors are displayed in the
+status bar and history so missing tools or network failures can be diagnosed. The finished executable is stripped and compressed
 with UPX; install UPX on the Linux build machine. The Windows runtime is built with Rust's
 size-focused optimization and omits Slint's unused SVG and default image-format support (the app's
 UI has no image assets).

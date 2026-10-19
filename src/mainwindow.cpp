@@ -70,29 +70,18 @@ std::optional<std::filesystem::path> extractBundledYtDlp(std::string &error_mess
         return std::nullopt;
     }
 
-    const DWORD directory_size = GetEnvironmentVariableW(L"LOCALAPPDATA", nullptr, 0);
-    if (directory_size == 0) {
-        error_message = "Could not locate the local application data directory.";
+    std::wstring temporary_directory(32768, L'\0');
+    const DWORD directory_length = GetTempPathW(
+        static_cast<DWORD>(temporary_directory.size()), temporary_directory.data());
+    if (directory_length == 0 || directory_length >= temporary_directory.size()) {
+        error_message = "Could not locate the temporary directory.";
         return std::nullopt;
     }
-    std::wstring local_app_data(directory_size, L'\0');
-    const DWORD directory_length = GetEnvironmentVariableW(
-        L"LOCALAPPDATA", local_app_data.data(), directory_size);
-    if (directory_length == 0 || directory_length >= directory_size) {
-        error_message = "Could not read the local application data directory.";
-        return std::nullopt;
-    }
-    local_app_data.resize(directory_length);
+    temporary_directory.resize(directory_length);
 
     std::wstring wide_version(version.begin(), version.end());
-    const auto executable_path = std::filesystem::path(local_app_data) / L"YT2Ogg" /
-        (L"yt-dlp-" + wide_version + L".exe");
-    std::error_code filesystem_error;
-    if (std::filesystem::is_regular_file(executable_path, filesystem_error) &&
-        std::filesystem::file_size(executable_path, filesystem_error) > 0) {
-        return executable_path;
-    }
-
+    const auto executable_path = std::filesystem::path(temporary_directory) / L"YT2Ogg" /
+        wide_version / L"yt-dlp.exe";
     const auto executable_data = LoadResource(module, executable_resource);
     const DWORD executable_size = SizeofResource(module, executable_resource);
     const auto *executable_bytes = static_cast<const char *>(LockResource(executable_data));
@@ -101,9 +90,15 @@ std::optional<std::filesystem::path> extractBundledYtDlp(std::string &error_mess
         return std::nullopt;
     }
 
+    std::error_code filesystem_error;
+    if (std::filesystem::is_regular_file(executable_path, filesystem_error) &&
+        std::filesystem::file_size(executable_path, filesystem_error) == executable_size) {
+        return executable_path;
+    }
+
     std::filesystem::create_directories(executable_path.parent_path(), filesystem_error);
     if (filesystem_error) {
-        error_message = "Could not create the yt-dlp application data directory.";
+        error_message = "Could not create the temporary yt-dlp directory.";
         return std::nullopt;
     }
     auto temporary_path = executable_path;
@@ -686,16 +681,18 @@ void MainWindow::startDownload(std::uint64_t download_id) {
         });
     };
     callbacks.finished = [this, alive, download_id](int status,
-                                                   const std::filesystem::path &file_path) {
+                                                   const std::filesystem::path &file_path,
+                                                   const std::string &error_message) {
         if (!alive->load()) return;
-        slint::invoke_from_event_loop([this, alive, download_id, status, file_path] {
+        slint::invoke_from_event_loop(
+            [this, alive, download_id, status, file_path, error_message] {
             if (!alive->load()) return;
             auto found = std::find_if(active_downloads_.begin(), active_downloads_.end(),
                                       [download_id](const auto &entry) {
                                           return entry.second == download_id;
                                       });
             if (found != active_downloads_.end()) {
-                onDownloadFinished(found->first, status, file_path);
+                onDownloadFinished(found->first, status, file_path, error_message);
             }
         });
     };
@@ -722,7 +719,8 @@ void MainWindow::processDownloadQueue() {
 }
 
 void MainWindow::onDownloadFinished(DownloadThread *download, int status,
-                                    const std::filesystem::path &file_path) {
+                                    const std::filesystem::path &file_path,
+                                    const std::string &error_message) {
     const auto active = active_downloads_.find(download);
     if (active == active_downloads_.end()) return;
     const std::uint64_t download_id = active->second;
@@ -738,7 +736,8 @@ void MainWindow::onDownloadFinished(DownloadThread *download, int status,
                 std::filesystem::file_size(file_path, error)));
         } else {
             info.status = 3;
-            info.progress = status == -2 ? "Cancelled" : "Failed";
+            info.progress = status == -2 ? "Cancelled" :
+                error_message.empty() ? "Failed" : "Failed: " + error_message;
         }
     }
 
@@ -750,7 +749,9 @@ void MainWindow::onDownloadFinished(DownloadThread *download, int status,
     refreshHistory();
     updateDownloadButton();
     processDownloadQueue();
-    if (active_downloads_.empty() && download_queue_.empty()) refreshStatus(status);
+    if (active_downloads_.empty() && download_queue_.empty()) {
+        refreshStatus(status, error_message);
+    }
 }
 
 int MainWindow::findDownloadIndex(std::uint64_t download_id) const {
@@ -779,14 +780,18 @@ void MainWindow::refreshHistory() {
     history_model_->set_vector(std::move(entries));
 }
 
-void MainWindow::refreshStatus(int last_status) {
+void MainWindow::refreshStatus(int last_status, const std::string &last_error) {
     if (!active_downloads_.empty()) {
         window_->set_status_text(toSlintString(
             std::to_string(active_downloads_.size()) + " download(s) active"));
     } else if (!download_queue_.empty()) {
         window_->set_status_text("Queued");
     } else if (last_status != -1) {
-        window_->set_status_text(last_status == 0 ? "Complete" : "Ready");
+        if (last_status != 0 && !last_error.empty()) {
+            window_->set_status_text(toSlintString(last_error));
+        } else {
+            window_->set_status_text(last_status == 0 ? "Complete" : "Ready");
+        }
     } else {
         window_->set_status_text("Ready");
     }
