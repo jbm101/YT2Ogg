@@ -15,13 +15,34 @@ set_languages("c++26")
 -- =====================
 target("YT2Ogg")
     set_kind("binary")
-    add_rules("qt.widgetapp")
+
+    before_build(function (target)
+        local generated_dir = path.join(target:autogendir(), "slint")
+        local generated_header = path.join(generated_dir, "generated_ui.h")
+        os.mkdir(generated_dir)
+        os.execv("slint-compiler", {
+            "--style", "native",
+            "src/ui/mainwindow.slint",
+            "-o", generated_header
+        })
+        target:add("includedirs", generated_dir)
+    end)
     
     -- Source files
     add_files("src/*.cpp")
-    add_files("src/*.h")
-    add_frameworks("QtNetwork")
-    
+    local slint_include_dir = os.getenv("SLINT_INCLUDE_DIR")
+    local slint_library_dir = os.getenv("SLINT_LIBRARY_DIR")
+    if slint_include_dir then
+        add_includedirs(slint_include_dir)
+    elseif is_plat("linux") then
+        add_includedirs("/usr/include/slint")
+    end
+    if slint_library_dir then
+        add_linkdirs(slint_library_dir)
+    elseif is_plat("linux") then
+        add_linkdirs("/usr/lib")
+    end
+    add_links("slint_cpp")
     -- Platform libraries
     if is_plat("linux") then
         add_syslinks("pthread", "dl", "rt")
@@ -30,7 +51,7 @@ target("YT2Ogg")
     elseif is_plat("macos") then
         add_frameworks("Cocoa", "AppKit")
     elseif is_plat("windows") then
-        add_syslinks("winmm", "ws2_32", "advapi32", "shell32")
+        add_syslinks("shell32", "ole32")
     end
     
     -- Compiler optimizations (release)

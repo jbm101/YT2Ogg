@@ -2,11 +2,7 @@ CompileFlags:
   Add:
     - --target=x86_64-linux-gnu
     - -std=c++26
-    - -I/usr/include/qt6
-    - -I/usr/include/qt6/QtWidgets
-    - -I/usr/include/qt6/QtGui
-    - -I/usr/include/qt6/QtCore
-    - -I/usr/include/qt6/QtNetwork
+    - -I/usr/include/slint
     - -Isrc
   Remove:
     - -std=c++23

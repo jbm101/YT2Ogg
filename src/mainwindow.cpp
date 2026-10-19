@@ -1,570 +1,760 @@
 #include "mainwindow.h"
+
+#include <algorithm>
 #include <array>
-#include <QAbstractItemView>
-#include <QApplication>
-#include <QClipboard>
-#include <QCloseEvent>
-#include <QCoreApplication>
-#include <QDesktopServices>
-#include <QFileDialog>
-#include <QFile>
-#include <QGroupBox>
-#include <QHeaderView>
-#include <QHBoxLayout>
-#include <QLabel>
-#include <QLineEdit>
-#include <QMessageBox>
-#include <QProgressBar>
-#include <QRegularExpression>
-#include <QRegularExpressionValidator>
-#include <QSizePolicy>
-#include <QSlider>
-#include <QStandardPaths>
-#include <QStyle>
-#include <QSysInfo>
-#include <QTimer>
+#include <cstdlib>
+#include <fstream>
+#include <iomanip>
+#include <optional>
+#include <regex>
+#include <sstream>
+#include <string_view>
+#include <thread>
+#include <system_error>
+#include <utility>
+#include <vector>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#include <shellapi.h>
+#include <shobjidl.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <cerrno>
+#include <cstring>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <unistd.h>
+extern char **environ;
+#else
+#include <cerrno>
+#include <cstring>
+#include <spawn.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 namespace {
-    constexpr int WindowMinWidth = 700;
-    constexpr int WindowMinHeight = 550;
-    constexpr int WindowInitWidth = 750;
-    constexpr int WindowInitHeight = 600;
-    constexpr int LayoutSpacing = 12;
-    constexpr int LayoutMargins = 16;
-    constexpr int GroupMargins = 12;
-    constexpr int ButtonMinWidth = 120;
-    constexpr int ButtonMaxWidth = 160;
-    constexpr int UrlInputHeight = 40;
-    constexpr int QualityLabelWidth = 90;
-    constexpr int HistoryRowHeight = 28;
-    constexpr int DialogWidth = 420;
-    constexpr int DialogHeight = 220;
-    constexpr int DialogMarginLeft = 24;
-    constexpr int DialogMarginTop = 20;
-    constexpr int DialogMarginRight = 24;
-    constexpr int DialogMarginBottom = 20;
-    constexpr int DialogSpacing = 16;
-    constexpr int ProgressBarMax = 100;
-    constexpr int ButtonWidth = 80;
-    constexpr int ResizeMarginOffset = 32;
-    constexpr int SpeedThreshold = 1024;
+constexpr std::size_t MaxConcurrentDownloads = 3;
+constexpr std::int64_t SizeThreshold = 1024;
+
+slint::SharedString toSlintString(std::string_view value) {
+    return slint::SharedString(value);
 }
 
-MainWindow::MainWindow(QWidget *parent)
-    : QMainWindow(parent)
+std::string fromSlintString(const slint::SharedString &value) {
+    return std::string(value.data(), value.size());
+}
 
-{
-    // Initialize settings
-    settings_ = new QSettings("YT2Ogg", "YT2Ogg", this);
+std::filesystem::path pathFromUtf8(std::string_view value) {
+#ifdef _WIN32
+    std::u8string encoded;
+    encoded.reserve(value.size());
+    for (unsigned char character : value) encoded.push_back(static_cast<char8_t>(character));
+    return std::filesystem::path(encoded);
+#else
+    return std::filesystem::path(value);
+#endif
+}
 
-    setupUI();
+std::string pathToUtf8(const std::filesystem::path &path) {
+    const auto encoded = path.u8string();
+    return std::string(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+}
+
+std::filesystem::path homeDirectory() {
+#ifdef _WIN32
+    if (const char *profile = std::getenv("USERPROFILE")) return profile;
+#else
+    if (const char *home = std::getenv("HOME")) return home;
+#endif
+    return std::filesystem::current_path();
+}
+
+std::filesystem::path defaultDownloadDirectory() {
+    const auto downloads = homeDirectory() / "Downloads";
+    std::error_code error;
+    if (std::filesystem::is_directory(downloads, error)) return downloads;
+    return homeDirectory();
+}
+
+std::optional<std::filesystem::path> chooseOutputDirectory(
+    const std::filesystem::path &initial_directory, std::string &error_message) {
+#ifdef _WIN32
+    const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool uninitialize = SUCCEEDED(initialized);
+    if (FAILED(initialized) && initialized != RPC_E_CHANGED_MODE) {
+        error_message = "Could not initialize the folder picker.";
+        return std::nullopt;
+    }
+
+    IFileOpenDialog *dialog = nullptr;
+    HRESULT result = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                      IID_PPV_ARGS(&dialog));
+    if (FAILED(result)) {
+        error_message = "Could not create the folder picker.";
+        if (uninitialize) CoUninitialize();
+        return std::nullopt;
+    }
+
+    FILEOPENDIALOGOPTIONS options{};
+    result = dialog->GetOptions(&options);
+    if (SUCCEEDED(result)) {
+        result = dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM |
+                                    FOS_PATHMUSTEXIST);
+    }
+    if (SUCCEEDED(result)) {
+        dialog->SetTitle(L"Choose output folder");
+        IShellItem *initial_folder = nullptr;
+        if (SUCCEEDED(SHCreateItemFromParsingName(initial_directory.c_str(), nullptr,
+                                                  IID_PPV_ARGS(&initial_folder)))) {
+            dialog->SetFolder(initial_folder);
+            initial_folder->Release();
+        }
+        result = dialog->Show(nullptr);
+    }
+
+    std::optional<std::filesystem::path> selected_directory;
+    if (result == HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+        // Closing the picker without choosing a folder is not an error.
+    } else if (SUCCEEDED(result)) {
+        IShellItem *selected_item = nullptr;
+        result = dialog->GetResult(&selected_item);
+        if (SUCCEEDED(result)) {
+            PWSTR selected_path = nullptr;
+            result = selected_item->GetDisplayName(SIGDN_FILESYSPATH, &selected_path);
+            if (SUCCEEDED(result)) {
+                selected_directory.emplace(selected_path);
+                CoTaskMemFree(selected_path);
+            }
+            selected_item->Release();
+        }
+        if (FAILED(result)) error_message = "Could not read the selected folder.";
+    } else {
+        error_message = "Could not open the folder picker.";
+    }
+
+    dialog->Release();
+    if (uninitialize) CoUninitialize();
+    return selected_directory;
+#else
+    struct CommandResult {
+        bool started = false;
+        int exit_code = -1;
+        std::string output;
+    };
+    const auto run_command = [](const std::vector<std::string> &arguments,
+                                CommandResult &command_result, std::string &error) {
+        int output_pipe[2];
+        if (pipe(output_pipe) != 0) {
+            error = "Could not create a folder-picker pipe: " + std::string(std::strerror(errno));
+            return;
+        }
+
+        posix_spawn_file_actions_t actions;
+        int spawn_error = posix_spawn_file_actions_init(&actions);
+        if (spawn_error != 0) {
+            close(output_pipe[0]);
+            close(output_pipe[1]);
+            error = "Could not prepare the folder picker: " +
+                std::string(std::strerror(spawn_error));
+            return;
+        }
+        if (spawn_error == 0) {
+            spawn_error = posix_spawn_file_actions_adddup2(&actions, output_pipe[1],
+                                                            STDOUT_FILENO);
+        }
+        if (spawn_error == 0) {
+            spawn_error = posix_spawn_file_actions_addclose(&actions, output_pipe[0]);
+        }
+        if (spawn_error == 0) {
+            spawn_error = posix_spawn_file_actions_addclose(&actions, output_pipe[1]);
+        }
+        if (spawn_error != 0) {
+            posix_spawn_file_actions_destroy(&actions);
+            close(output_pipe[0]);
+            close(output_pipe[1]);
+            error = "Could not prepare the folder picker: " +
+                std::string(std::strerror(spawn_error));
+            return;
+        }
+
+        std::vector<char *> argv;
+        argv.reserve(arguments.size() + 1);
+        for (const auto &argument : arguments) {
+            argv.push_back(const_cast<char *>(argument.c_str()));
+        }
+        argv.push_back(nullptr);
+        pid_t child = -1;
+        spawn_error = posix_spawnp(&child, argv.front(), &actions, nullptr, argv.data(), environ);
+        posix_spawn_file_actions_destroy(&actions);
+        close(output_pipe[1]);
+        if (spawn_error != 0) {
+            close(output_pipe[0]);
+            if (spawn_error != ENOENT) {
+                error = "Could not start the folder picker: " +
+                    std::string(std::strerror(spawn_error));
+            }
+            return;
+        }
+        command_result.started = true;
+
+        char buffer[1024];
+        int read_error = 0;
+        for (;;) {
+            const ssize_t bytes_read = read(output_pipe[0], buffer, sizeof(buffer));
+            if (bytes_read > 0) {
+                command_result.output.append(buffer, static_cast<std::size_t>(bytes_read));
+            } else if (bytes_read == 0) {
+                break;
+            } else if (errno != EINTR) {
+                read_error = errno;
+                break;
+            }
+        }
+        close(output_pipe[0]);
+
+        int child_status = 0;
+        while (waitpid(child, &child_status, 0) < 0) {
+            if (errno != EINTR) {
+                error = "Could not wait for the folder picker to finish: " +
+                    std::string(std::strerror(errno));
+                return;
+            }
+        }
+        if (read_error != 0) {
+            error = "Could not read the folder-picker result: " +
+                std::string(std::strerror(read_error));
+            return;
+        }
+        command_result.exit_code = WIFEXITED(child_status) ? WEXITSTATUS(child_status) : -1;
+    };
+
+#ifdef __APPLE__
+    CommandResult result;
+    run_command({"osascript", "-e",
+                 "try\n"
+                 "set selectedFolder to choose folder with prompt \"Choose output folder\"\n"
+                 "POSIX path of selectedFolder\n"
+                 "on error number -128\n"
+                 "\"__YT2OGG_CANCELLED__\"\n"
+                 "end try"},
+                result, error_message);
+    if (!error_message.empty()) return std::nullopt;
+    if (!result.started) {
+        error_message = "Could not find osascript to open the folder picker.";
+        return std::nullopt;
+    }
+    if (result.exit_code != 0) {
+        error_message = "The folder picker failed.";
+        return std::nullopt;
+    }
+    while (!result.output.empty() &&
+           (result.output.back() == '\n' || result.output.back() == '\r')) {
+        result.output.pop_back();
+    }
+    if (result.output == "__YT2OGG_CANCELLED__") return std::nullopt;
+#else
+    std::string initial_path = pathToUtf8(initial_directory);
+    if (!initial_path.empty() && initial_path.back() != '/') initial_path.push_back('/');
+    CommandResult result;
+    run_command({"zenity", "--file-selection", "--directory",
+                 "--title=Choose output folder", "--filename=" + initial_path},
+                result, error_message);
+    if (!error_message.empty()) return std::nullopt;
+    if (!result.started) {
+        run_command({"kdialog", "--getexistingdirectory", pathToUtf8(initial_directory),
+                     "--title", "Choose output folder"}, result, error_message);
+        if (!error_message.empty()) return std::nullopt;
+        if (!result.started) {
+            error_message = "Install zenity or kdialog to choose an output folder.";
+            return std::nullopt;
+        }
+    }
+    if (result.exit_code == 1) return std::nullopt;
+#endif
+
+    if (result.exit_code != 0) {
+        error_message = "The folder picker failed.";
+        return std::nullopt;
+    }
+    while (!result.output.empty() &&
+           (result.output.back() == '\n' || result.output.back() == '\r')) {
+        result.output.pop_back();
+    }
+    if (result.output.empty()) {
+        error_message = "The folder picker did not return a folder.";
+        return std::nullopt;
+    }
+    return pathFromUtf8(result.output);
+#endif
+}
+
+std::filesystem::path settingsFile() {
+#ifdef _WIN32
+    if (const char *app_data = std::getenv("APPDATA")) {
+        return std::filesystem::path(app_data) / "YT2Ogg" / "settings.ini";
+    }
+#else
+    if (const char *config = std::getenv("XDG_CONFIG_HOME")) {
+        return std::filesystem::path(config) / "yt2ogg" / "settings.ini";
+    }
+#endif
+    return homeDirectory() / ".config" / "yt2ogg" / "settings.ini";
+}
+
+void openWithSystem(const std::filesystem::path &path) {
+#ifdef _WIN32
+    const std::wstring wide_path = path.wstring();
+    ShellExecuteW(nullptr, L"open", wide_path.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+#else
+    const pid_t child = fork();
+    if (child == 0) {
+#ifdef __APPLE__
+        execlp("open", "open", path.c_str(), static_cast<char *>(nullptr));
+#else
+        execlp("xdg-open", "xdg-open", path.c_str(), static_cast<char *>(nullptr));
+#endif
+        _exit(127);
+    }
+    if (child > 0) {
+        std::thread([child] {
+            int status = 0;
+            waitpid(child, &status, 0);
+        }).detach();
+    }
+#endif
+}
+
+std::filesystem::path executablePath(const char *argv0) {
+    std::error_code error;
+#ifdef _WIN32
+    std::wstring buffer(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(),
+                                            static_cast<DWORD>(buffer.size()));
+    if (length > 0 && length < buffer.size()) {
+        buffer.resize(length);
+        return buffer;
+    }
+#elif defined(__APPLE__)
+    uint32_t buffer_size = 0;
+    _NSGetExecutablePath(nullptr, &buffer_size);
+    std::string buffer(buffer_size, '\0');
+    if (_NSGetExecutablePath(buffer.data(), &buffer_size) == 0) {
+        return std::filesystem::weakly_canonical(buffer.c_str(), error);
+    }
+#else
+    const auto proc_path = std::filesystem::read_symlink("/proc/self/exe", error);
+    if (!error) return proc_path;
+#endif
+    return std::filesystem::absolute(argv0, error);
+}
+}
+
+MainWindow::MainWindow(std::filesystem::path executable_path)
+    : executable_path_(executablePath(executable_path.string().c_str())),
+      settings_path_(settingsFile()),
+      window_(MainWindowUI::create()),
+      history_model_(std::make_shared<slint::VectorModel<DownloadItem>>()) {
+    window_->set_history(history_model_);
     loadSettings();
 
-    setWindowTitle(tr("YT2Ogg - YouTube to Opus"));
-    setMinimumSize(WindowMinWidth, WindowMinHeight);
-    resize(WindowInitWidth, WindowInitHeight);
+    window_->on_download_requested([this](const slint::SharedString &url) {
+        const std::string value = fromSlintString(url);
+        static const std::regex youtube_url(
+            R"(^https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)\S+$)",
+            std::regex::icase);
+        if (!std::regex_match(value, youtube_url)) {
+            window_->set_status_text("Enter a valid YouTube URL (youtube.com or youtu.be).");
+            return;
+        }
+
+        std::error_code error;
+        const auto output_directory = getOutputDir();
+        if (output_directory.empty() ||
+            !std::filesystem::is_directory(output_directory, error)) {
+            window_->set_status_text("Choose an existing output folder first.");
+            return;
+        }
+
+        window_->set_url("");
+        download_queue_.push_back(addDownloadItem(value));
+        processDownloadQueue();
+    });
+    window_->on_choose_output_directory([this] {
+        std::string picker_error;
+        const auto path = chooseOutputDirectory(getOutputDir(), picker_error);
+        if (!picker_error.empty()) {
+            window_->set_status_text(toSlintString(picker_error));
+            return;
+        }
+        if (!path) return;
+
+        std::error_code error;
+        if (!std::filesystem::is_directory(*path, error)) {
+            window_->set_status_text("The selected output folder is not accessible.");
+            return;
+        }
+        window_->set_output_directory(toSlintString(pathToUtf8(*path)));
+        saveSettings();
+        window_->set_status_text("Output folder updated.");
+    });
+    window_->on_quality_changed([this](int quality) {
+        window_->set_quality(std::clamp(quality, 0, 3));
+        saveSettings();
+    });
+    window_->on_open_file([this](int index) { openFile(index); });
+    window_->on_open_folder([this](int index) { openFolder(index); });
+    window_->on_open_project_link([] {
+        openWithSystem(pathFromUtf8("https://github.com/jbm101/YT2Ogg"));
+    });
+    window_->on_remove_item([this](int index) { removeItem(index); });
+    window_->on_clear_history([this] {
+        download_history_.erase(
+            std::remove_if(download_history_.begin(), download_history_.end(),
+                           [](const DownloadInfo &info) { return info.status != 1; }),
+            download_history_.end());
+        download_queue_.clear();
+        refreshHistory();
+        updateDownloadButton();
+        refreshStatus();
+    });
+
+    const auto alive = alive_;
+    window_->window().on_close_requested([alive] {
+        if (alive->load()) slint::quit_event_loop();
+        return slint::CloseRequestResponse::HideWindow;
+    });
 }
 
 MainWindow::~MainWindow() {
-    const auto downloads = activeDownloads_.keys();
-    for (DownloadThread *download : downloads) {
+    alive_->store(false);
+    for (auto &[download, id] : active_downloads_) {
+        (void)id;
         download->cancel();
     }
-    for (DownloadThread *download : downloads) {
-        download->wait();
+    for (auto &download : download_workers_) {
+        download->join();
     }
 }
 
-void MainWindow::setupUI() {
-    auto *central = new QWidget(this);
-    auto *mainLayout = new QVBoxLayout(central);
-    mainLayout->setSpacing(LayoutSpacing);
-    mainLayout->setContentsMargins(LayoutMargins, LayoutSpacing, LayoutMargins, LayoutSpacing);
-
-    auto *urlGroup = new QWidget(central);
-    auto *urlLayout = new QVBoxLayout(urlGroup);
-    urlLayout->setContentsMargins(GroupMargins, GroupMargins, GroupMargins, GroupMargins);
-
-    auto *urlRow = new QHBoxLayout();
-    urlInput_ = new QLineEdit(urlGroup);
-    urlInput_->setPlaceholderText(
-        tr("Paste YouTube URL here... (e.g., https://youtube.com/watch?v=...)"));
-    urlInput_->setMinimumHeight(UrlInputHeight);
-
-    // URL validation with QRegularExpressionValidator
-    QRegularExpression urlRe(
-        R"(https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)\S+)");
-    urlInput_->setValidator(new QRegularExpressionValidator(urlRe, urlInput_));
-
-    auto *pasteAction = new QAction(this);
-    pasteAction->setShortcut(QKeySequence::Paste);
-    connect(pasteAction, &QAction::triggered, this, [this]() {
-        urlInput_->setText(QApplication::clipboard()->text());
-    });
-    addAction(pasteAction);
-
-    urlRow->addWidget(urlInput_);
-
-    downloadBtn_ = new QPushButton(tr("Download"), urlGroup);
-    downloadBtn_->setMinimumWidth(ButtonMinWidth);
-    downloadBtn_->setMaximumWidth(ButtonMaxWidth);
-    downloadBtn_->setCursor(Qt::PointingHandCursor);
-    connect(downloadBtn_, &QPushButton::clicked, this, &MainWindow::onDownloadClicked);
-    urlRow->addWidget(downloadBtn_);
-
-    browseBtn_ = new QPushButton(qApp->style()->standardIcon(QStyle::SP_DirIcon),
-                                  tr("Set Output Folder"), urlGroup);
-    browseBtn_->setCursor(Qt::PointingHandCursor);
-    connect(browseBtn_, &QPushButton::clicked, this, &MainWindow::onBrowseClicked);
-    urlRow->addWidget(browseBtn_);
-
-    urlLayout->addLayout(urlRow);
-
-    outputDirLabel_ = new QLabel(urlGroup);
-    outputDirLabel_->setText(tr("Output: %1").arg(getOutputDir()));
-    urlLayout->addWidget(outputDirLabel_);
-
-    mainLayout->addWidget(urlGroup);
-
-    mainLayout->addSpacing(4);
-
-    qualityWidget_ = new QWidget(central);
-    qualityWidget_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-    auto *qualityRow = new QHBoxLayout(qualityWidget_);
-    qualityRow->setContentsMargins(0, 0, 0, 0);
-
-    auto *qualityLabel = new QLabel(tr("Audio Quality:"), central);
-    qualitySlider_ = new QSlider(Qt::Horizontal, central);
-    qualitySlider_->setRange(0, 3);
-    qualitySlider_->setValue(0);
-    qualitySlider_->setTickPosition(QSlider::TicksBelow);
-    qualitySlider_->setTickInterval(1);
-    qualitySlider_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-    qualitySliderLabel_ = new QLabel(tr("Source"), central);
-    qualitySliderLabel_->setFixedWidth(QualityLabelWidth);
-    connect(qualitySlider_, &QSlider::valueChanged,
-            this, [this](int v) {
-                constexpr std::array<const char *, 4> qualityLabels = {"Source", "96 kbps", "80 kbps", "64 kbps"};
-                qualitySliderLabel_->setText(tr("%1").arg(qualityLabels[v]));
-                saveSettings();
-            });
-
-    qualityRow->addWidget(qualityLabel);
-    qualityRow->addWidget(qualitySlider_);
-    qualityRow->addWidget(qualitySliderLabel_);
-    mainLayout->addWidget(qualityWidget_);
-    mainLayout->addStretch();
-
-    auto *historyGroup = new QWidget(central);
-    auto *historyLayout = new QVBoxLayout(historyGroup);
-    historyLayout->setContentsMargins(GroupMargins, GroupMargins, GroupMargins, GroupMargins);
-
-    historyTable_ = new QTableWidget(historyGroup);
-    historyTable_->setColumnCount(4);
-    historyTable_->setHorizontalHeaderLabels(
-        {tr("Title"), tr("Status"), tr("Size"), tr("Speed")});
-    historyTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
-    historyTable_->setSelectionMode(QAbstractItemView::SingleSelection);
-    historyTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    historyTable_->setAlternatingRowColors(true);
-    historyTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-    historyTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
-    historyTable_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
-    historyTable_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
-    historyTable_->verticalHeader()->setVisible(true);
-    historyTable_->verticalHeader()->setDefaultSectionSize(HistoryRowHeight);
-    historyTable_->setContextMenuPolicy(Qt::CustomContextMenu);
-    connect(historyTable_, &QTableWidget::itemDoubleClicked,
-            this, &MainWindow::onItemDoubleClicked);
-    connect(historyTable_, &QTableWidget::customContextMenuRequested,
-            this, &MainWindow::onContextMenu);
-
-    historyLayout->addWidget(historyTable_);
-
-    auto *historyButtons = new QHBoxLayout();
-    historyButtons->addStretch();
-
-    auto *clearAllBtn = new QPushButton(tr("Clear All"), historyGroup);
-    connect(clearAllBtn, &QPushButton::clicked, this, &MainWindow::onClearAll);
-    historyButtons->addWidget(clearAllBtn);
-
-    historyLayout->addLayout(historyButtons);
-    mainLayout->addWidget(historyGroup, 1);
-
-    statsLabel_ = new QLabel(tr("Ready"), central);
-    statsLabel_->setAlignment(Qt::AlignCenter);
-    mainLayout->addWidget(statsLabel_);
-
-    setCentralWidget(central);
+int MainWindow::run() {
+    window_->show();
+    window_->run();
+    return 0;
 }
 
 void MainWindow::loadSettings() {
-    // Restore download directory (with default fallback)
-    QString downloadDir = settings_->value("downloadDir", "").toString();
-    if (downloadDir.isEmpty()) {
-        downloadDir = QStandardPaths::writableLocation(
-            QStandardPaths::DownloadLocation);
-        if (downloadDir.isEmpty()) {
-            downloadDir = QDir::homePath() + "/Downloads";
+    std::filesystem::path output_directory;
+    int quality = 0;
+    {
+        std::ifstream settings(settings_path_);
+        std::string key;
+        while (settings >> key) {
+            if (key == "downloadDir") {
+                std::string path;
+                settings >> std::quoted(path);
+                output_directory = pathFromUtf8(path);
+            } else if (key == "quality") {
+                settings >> quality;
+            } else {
+                std::string ignored;
+                std::getline(settings, ignored);
+            }
         }
-        settings_->setValue("downloadDir", downloadDir);
     }
 
-    // Restore quality setting
-    int quality = settings_->value("quality", 0).toInt();
-    quality = qBound(0, quality, 3);
-    qualitySlider_->setValue(quality);
+    std::error_code error;
+    if (output_directory.empty() || !std::filesystem::is_directory(output_directory, error)) {
+        output_directory = defaultDownloadDirectory();
+    }
+    window_->set_output_directory(toSlintString(pathToUtf8(output_directory)));
+    window_->set_quality(std::clamp(quality, 0, 3));
+    saveSettings();
 }
 
 void MainWindow::saveSettings() {
-    QString downloadDir = getOutputDir();
-    if (downloadDir.isEmpty()) {
-        downloadDir = QStandardPaths::writableLocation(
-            QStandardPaths::DownloadLocation);
-    }
-    settings_->setValue("downloadDir", downloadDir);
-    settings_->setValue("quality", qualitySlider_->value());
+    std::error_code error;
+    std::filesystem::create_directories(settings_path_.parent_path(), error);
+    std::ofstream settings(settings_path_, std::ios::trunc);
+    if (!settings) return;
+    settings << "downloadDir " << std::quoted(pathToUtf8(getOutputDir())) << '\n'
+             << "quality " << getAudioQuality() << '\n';
 }
 
-QString MainWindow::getOutputDir() const {
-    return settings_->value("downloadDir", "").toString();
+std::filesystem::path MainWindow::getOutputDir() const {
+    return pathFromUtf8(fromSlintString(window_->get_output_directory()));
 }
 
 int MainWindow::getAudioQuality() const {
-    return qualitySlider_->value();
+    return window_->get_quality();
 }
 
-void MainWindow::startDownload(quint64 downloadId) {
-    const int index = findDownloadIndex(downloadId);
-    if (index < 0) {
-        return;
-    }
+std::uint64_t MainWindow::addDownloadItem(const std::string &url) {
+    DownloadInfo info;
+    info.id = next_download_id_++;
+    info.url = url;
+    const auto scheme = url.find("://");
+    const auto path_begin = scheme == std::string::npos ? 0 : scheme + 3;
+    const auto path_end = url.find('/', path_begin);
+    info.title = url.substr(path_begin, path_end == std::string::npos
+                                          ? std::string::npos : path_end - path_begin);
+    if (path_end != std::string::npos) info.title += url.substr(path_end);
+    download_history_.push_back(std::move(info));
+    refreshHistory();
+    return download_history_.back().id;
+}
 
-    QList<QTableWidgetItem *> items;
-    for (int column = 0; column < historyTable_->columnCount(); ++column) {
-        items.append(historyTable_->takeItem(index, column));
-    }
-    historyTable_->removeRow(index);
-    historyTable_->insertRow(0);
-    for (int column = 0; column < items.size(); ++column) {
-        historyTable_->setItem(0, column, items[column]);
-    }
-    downloadHistory_.prepend(downloadHistory_.takeAt(index));
-    DownloadInfo &info = downloadHistory_.first();
+void MainWindow::startDownload(std::uint64_t download_id) {
+    const int index = findDownloadIndex(download_id);
+    if (index < 0) return;
+
+    DownloadInfo info = std::move(download_history_[static_cast<std::size_t>(index)]);
+    download_history_.erase(download_history_.begin() + index);
     info.status = 1;
-    info.startTime = QDateTime::currentDateTime();
-    historyTable_->setItem(0, 1, new QTableWidgetItem(tr("Downloading...")));
+    info.start_time = std::chrono::steady_clock::now();
+    info.progress = "-";
+    info.speed = "-";
+    download_history_.insert(download_history_.begin(), std::move(info));
+    refreshHistory();
 
-    auto *download = new DownloadThread(this);
-    activeDownloads_.insert(download, downloadId);
-    connect(download, &DownloadThread::progress, this,
-            [this, download](qint64 received, qint64 total) {
-                onDownloadProgress(download, received, total);
-            });
-    connect(download, &DownloadThread::speedChanged, this,
-            [this, download](qint64 speed) {
-                onDownloadSpeedChanged(download, speed);
-            });
-    connect(download, &DownloadThread::statusChanged, this,
-            [this, download](const QString &status) {
-                onDownloadStatusChanged(download, status);
-            });
-    connect(download, &DownloadThread::titleFound, this,
-            [this, download](const QString &title) {
-                const int row = findDownloadIndex(activeDownloads_.value(download));
-                if (row < 0) {
-                    return;
+    auto ytdlp_path = executable_path_.parent_path() /
+#ifdef _WIN32
+        "yt-dlp.exe";
+#else
+        "yt-dlp";
+#endif
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(ytdlp_path, error)) {
+#ifdef _WIN32
+        ytdlp_path = "yt-dlp.exe";
+#else
+        ytdlp_path = "yt-dlp";
+#endif
+    }
+
+    const auto alive = alive_;
+    DownloadThread::Callbacks callbacks;
+    callbacks.progress = [this, alive, download_id](std::int64_t received, std::int64_t total) {
+        if (!alive->load()) return;
+        slint::invoke_from_event_loop([this, alive, download_id, received, total] {
+            if (alive->load()) {
+                const int index = findDownloadIndex(download_id);
+                if (index >= 0) {
+                    download_history_[static_cast<std::size_t>(index)].progress =
+                        formatFileSize(received) + " / " + formatFileSize(total);
+                    refreshHistory();
                 }
-                downloadHistory_[row].title = title;
-                historyTable_->setItem(row, 0, new QTableWidgetItem(title));
-            });
-    connect(download, &DownloadThread::finished, this,
-            [this, download](int status, const QString &filePath) {
-                onDownloadFinished(download, status, filePath);
-            });
+            }
+        });
+    };
+    callbacks.speed_changed = [this, alive, download_id](std::int64_t speed) {
+        if (!alive->load()) return;
+        slint::invoke_from_event_loop([this, alive, download_id, speed] {
+            if (alive->load()) {
+                const int index = findDownloadIndex(download_id);
+                if (index >= 0) {
+                    download_history_[static_cast<std::size_t>(index)].speed =
+                        formatFileSize(speed) + "/s";
+                    refreshHistory();
+                }
+            }
+        });
+    };
+    callbacks.status_changed = [this, alive, download_id](const std::string &status) {
+        if (!alive->load()) return;
+        slint::invoke_from_event_loop([this, alive, download_id, status] {
+            if (alive->load()) {
+                const int index = findDownloadIndex(download_id);
+                if (index >= 0) {
+                    download_history_[static_cast<std::size_t>(index)].progress = status;
+                    refreshHistory();
+                }
+            }
+        });
+    };
+    callbacks.title_found = [this, alive, download_id](const std::string &title) {
+        if (!alive->load()) return;
+        slint::invoke_from_event_loop([this, alive, download_id, title] {
+            if (alive->load()) {
+                const int index = findDownloadIndex(download_id);
+                if (index >= 0) {
+                    download_history_[static_cast<std::size_t>(index)].title = title;
+                    refreshHistory();
+                }
+            }
+        });
+    };
+    callbacks.finished = [this, alive, download_id](int status,
+                                                   const std::filesystem::path &file_path) {
+        if (!alive->load()) return;
+        slint::invoke_from_event_loop([this, alive, download_id, status, file_path] {
+            if (!alive->load()) return;
+            auto found = std::find_if(active_downloads_.begin(), active_downloads_.end(),
+                                      [download_id](const auto &entry) {
+                                          return entry.second == download_id;
+                                      });
+            if (found != active_downloads_.end()) {
+                onDownloadFinished(found->first, status, file_path);
+            }
+        });
+    };
 
+    auto worker = std::make_unique<DownloadThread>(
+        download_history_.front().url, getOutputDir(), ytdlp_path, getAudioQuality(),
+        std::move(callbacks));
+    DownloadThread *worker_pointer = worker.get();
+    active_downloads_.emplace(worker_pointer, download_id);
+    download_workers_.push_back(std::move(worker));
     updateDownloadButton();
-    updateStatsLabel();
-    QString ytDlpPath = QCoreApplication::applicationDirPath() + "/" +
-                        (QSysInfo::productType() == "windows" ? "yt-dlp.exe" : "yt-dlp");
-    download->startDownload(info.url, getOutputDir(), ytDlpPath,
-                            getAudioQuality());
-}
-
-void MainWindow::onDownloadClicked() {
-    QString url = urlInput_->text().trimmed();
-    if (url.isEmpty()) {
-        QMessageBox::warning(this, tr("No URL"),
-                             tr("Please enter a YouTube URL."));
-        return;
-    }
-
-    if (!url.startsWith("http://") && !url.startsWith("https://")) {
-        QMessageBox::warning(this, tr("Invalid URL"),
-                             tr("Please enter a valid URL starting with http:// or https://"));
-        return;
-    }
-
-    QString outputDir = getOutputDir();
-    if (outputDir.isEmpty() || !QDir(outputDir).exists()) {
-        onBrowseClicked();
-        if (getOutputDir().isEmpty()) return;
-        outputDir = getOutputDir();
-    }
-
-    urlInput_->clear();
-    const quint64 downloadId = addDownloadItem(url, QString());
-    downloadQueue_.append(downloadId);
-    processDownloadQueue();
-    updateDownloadButton();
-}
-
-void MainWindow::onBrowseClicked() {
-    QString dir = QFileDialog::getExistingDirectory(this,
-        tr("Set Output Folder"),
-        getOutputDir(),
-        QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
-
-    if (!dir.isEmpty()) {
-        settings_->setValue("downloadDir", dir);
-        browseBtn_->setText(dir);
-        outputDirLabel_->setText(tr("Output: %1").arg(dir));
-    }
-}
-
-void MainWindow::onDownloadProgress(DownloadThread *download, qint64 received, qint64 total) {
-    const int row = findDownloadIndex(activeDownloads_.value(download));
-    if (row >= 0) {
-        historyTable_->setItem(row, 2, new QTableWidgetItem(
-            tr("%1 / %2")
-                .arg(formatFileSize(received))
-                .arg(formatFileSize(total))));
-    }
-}
-
-void MainWindow::onDownloadSpeedChanged(DownloadThread *download, qint64 speed) {
-    const int row = findDownloadIndex(activeDownloads_.value(download));
-    if (row >= 0) {
-        historyTable_->setItem(row, 3, new QTableWidgetItem(
-            tr("%1/s").arg(formatFileSize(speed))));
-    }
-}
-
-void MainWindow::onDownloadStatusChanged(DownloadThread *download, const QString &status) {
-    const int row = findDownloadIndex(activeDownloads_.value(download));
-    if (row >= 0) {
-        historyTable_->setItem(row, 1, new QTableWidgetItem(status));
-    }
-}
-
-void MainWindow::onDownloadFinished(DownloadThread *download, int status,
-                                    const QString &filePath) {
-    const quint64 downloadId = activeDownloads_.take(download);
-    const int row = findDownloadIndex(downloadId);
-    if (row >= 0) {
-        DownloadInfo &info = downloadHistory_[row];
-        const int elapsed = static_cast<int>(info.startTime.secsTo(QDateTime::currentDateTime()));
-
-        if (status == 0 && !filePath.isEmpty()) {
-            historyTable_->setItem(row, 1, new QTableWidgetItem(tr("Complete")));
-            const QFileInfo fileInfo(filePath);
-            historyTable_->setItem(row, 2, new QTableWidgetItem(formatFileSize(fileInfo.size())));
-            info.filePath = filePath;
-            info.fileSize = fileInfo.size();
-            info.status = 2;
-        } else if (status == -2) {
-            historyTable_->setItem(row, 1, new QTableWidgetItem(tr("Cancelled")));
-            info.status = 3;
-        } else {
-            historyTable_->setItem(row, 1, new QTableWidgetItem(tr("Failed")));
-            info.status = 3;
-        }
-        historyTable_->setItem(row, 3, new QTableWidgetItem(formatDuration(elapsed)));
-    }
-
-    download->deleteLater();
-    updateDownloadButton();
-    processDownloadQueue();
-    if (activeDownloads_.isEmpty() && downloadQueue_.isEmpty()) {
-        updateStatsLabel(status);
-    }
+    refreshStatus();
+    worker_pointer->start();
 }
 
 void MainWindow::processDownloadQueue() {
-    constexpr int MaxConcurrentDownloads = 3;
-    while (!downloadQueue_.isEmpty() &&
-           activeDownloads_.size() < MaxConcurrentDownloads) {
-        const quint64 downloadId = downloadQueue_.takeFirst();
-        startDownload(downloadId);
+    while (!download_queue_.empty() && active_downloads_.size() < MaxConcurrentDownloads) {
+        const std::uint64_t id = download_queue_.front();
+        download_queue_.erase(download_queue_.begin());
+        startDownload(id);
     }
     updateDownloadButton();
-    updateStatsLabel();
+    refreshStatus();
 }
 
-void MainWindow::onItemDoubleClicked(QTableWidgetItem *item) {
-    int row = item->row();
-    if (row >= 0 && row < static_cast<int>(downloadHistory_.size())) {
-        const DownloadInfo &info = downloadHistory_[row];
-        if (!info.filePath.isEmpty() && QFile::exists(info.filePath)) {
-            QDesktopServices::openUrl(QUrl::fromLocalFile(info.filePath));
+void MainWindow::onDownloadFinished(DownloadThread *download, int status,
+                                    const std::filesystem::path &file_path) {
+    const auto active = active_downloads_.find(download);
+    if (active == active_downloads_.end()) return;
+    const std::uint64_t download_id = active->second;
+    active_downloads_.erase(active);
+    const int index = findDownloadIndex(download_id);
+    if (index >= 0) {
+        DownloadInfo &info = download_history_[static_cast<std::size_t>(index)];
+        const int elapsed = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - info.start_time).count());
+        if (status == 0 && !file_path.empty()) {
+            std::error_code error;
+            info.status = 2;
+            info.file_path = file_path;
+            info.file_size = std::filesystem::file_size(file_path, error);
+            info.progress = formatFileSize(static_cast<std::int64_t>(info.file_size));
+        } else {
+            info.status = 3;
+            info.progress = status == -2 ? "Cancelled" : "Failed";
         }
-    }
-}
-
-void MainWindow::onContextMenu(const QPoint &pos) {
-    QTableWidgetItem *item = historyTable_->itemAt(pos);
-    if (!item) return;
-
-    int row = item->row();
-    QMenu menu(this);
-
-    auto *openAction = menu.addAction(tr("Open File"));
-    auto *openFolderAction = menu.addAction(tr("Open Containing Folder"));
-    auto *removeAction = menu.addAction(tr("Remove"));
-    if (row < downloadHistory_.size() && downloadHistory_[row].status == 1) {
-        removeAction->setEnabled(false);
+        info.speed = formatDuration(elapsed);
     }
 
-    QAction *selected = menu.exec(historyTable_->viewport()->mapToGlobal(pos));
-    if (selected == openAction) {
-        onItemDoubleClicked(item);
-    } else if (selected == openFolderAction) {
-        if (row < static_cast<int>(downloadHistory_.size()) &&
-            !downloadHistory_[row].filePath.isEmpty()) {
-            QDesktopServices::openUrl(
-                QUrl::fromLocalFile(
-                    QFileInfo(downloadHistory_[row].filePath).path()));
-        }
-    } else if (selected == removeAction) {
-        onRemoveItem(item);
-    }
-}
-
-void MainWindow::onRemoveItem(QTableWidgetItem *item) {
-    int row = item->row();
-    if (row >= 0 && row < static_cast<int>(downloadHistory_.size())) {
-        if (downloadHistory_[row].status == 1) {
-            return;
-        }
-        if (downloadHistory_[row].status == 0) {
-            downloadQueue_.removeAll(downloadHistory_[row].id);
-        }
-        downloadHistory_.removeAt(row);
-        historyTable_->removeRow(row);
-        updateDownloadButton();
-    }
-}
-
-void MainWindow::onClearAll() {
-    for (int row = static_cast<int>(downloadHistory_.size()) - 1; row >= 0; --row) {
-        if (downloadHistory_[row].status != 1) {
-            historyTable_->removeRow(row);
-            downloadHistory_.removeAt(row);
-        }
-    }
-    downloadQueue_.clear();
+    download->join();
+    download_workers_.erase(
+        std::remove_if(download_workers_.begin(), download_workers_.end(),
+                       [download](const auto &worker) { return worker.get() == download; }),
+        download_workers_.end());
+    refreshHistory();
     updateDownloadButton();
-    updateStatsLabel();
+    processDownloadQueue();
+    if (active_downloads_.empty() && download_queue_.empty()) refreshStatus(status);
 }
 
-void MainWindow::onOpenDownloadFolder() {
-    QString dir = getOutputDir();
-    if (dir.isEmpty()) dir = QDir::homePath() + "/Downloads";
-    QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
-}
-
-quint64 MainWindow::addDownloadItem(const QString &url, const QString &title) {
-    QString displayTitle = title;
-    if (displayTitle.isEmpty()) {
-        QUrl qUrl(url);
-        displayTitle = qUrl.host() + qUrl.path();
-    }
-
-    const int row = historyTable_->rowCount();
-    historyTable_->insertRow(row);
-    historyTable_->setItem(row, 0, new QTableWidgetItem(displayTitle));
-    historyTable_->setItem(row, 1, new QTableWidgetItem(tr("Queued")));
-    historyTable_->setItem(row, 2, new QTableWidgetItem(tr("-")));
-    historyTable_->setItem(row, 3, new QTableWidgetItem(tr("-")));
-
-    DownloadInfo info;
-    info.id = nextDownloadId_++;
-    info.url = url;
-    info.title = title;
-    info.status = 0;
-    downloadHistory_.append(info);
-    return info.id;
-}
-
-int MainWindow::findDownloadIndex(quint64 downloadId) const {
-    for (int i = 0; i < static_cast<int>(downloadHistory_.size()); ++i) {
-        if (downloadHistory_[i].id == downloadId) {
-            return i;
-        }
+int MainWindow::findDownloadIndex(std::uint64_t download_id) const {
+    for (std::size_t index = 0; index < download_history_.size(); ++index) {
+        if (download_history_[index].id == download_id) return static_cast<int>(index);
     }
     return -1;
 }
 
+void MainWindow::refreshHistory() {
+    std::vector<DownloadItem> entries;
+    entries.reserve(download_history_.size());
+    for (const DownloadInfo &info : download_history_) {
+        std::string status;
+        switch (info.status) {
+        case 0: status = "Queued"; break;
+        case 1: status = info.progress == "Encoding" ? "Encoding" : "Downloading..."; break;
+        case 2: status = "Complete"; break;
+        default: status = info.progress == "Cancelled" ? "Cancelled" : "Failed"; break;
+        }
+        entries.push_back(DownloadItem{
+            toSlintString(info.title), toSlintString(status), toSlintString(info.progress),
+            toSlintString(info.speed), toSlintString(pathToUtf8(info.file_path)), info.status
+        });
+    }
+    history_model_->set_vector(std::move(entries));
+}
+
+void MainWindow::refreshStatus(int last_status) {
+    if (!active_downloads_.empty()) {
+        window_->set_status_text(toSlintString(
+            std::to_string(active_downloads_.size()) + " download(s) active"));
+    } else if (!download_queue_.empty()) {
+        window_->set_status_text("Queued");
+    } else if (last_status != -1) {
+        window_->set_status_text(last_status == 0 ? "Complete" : "Ready");
+    } else {
+        window_->set_status_text("Ready");
+    }
+}
+
 void MainWindow::updateDownloadButton() {
-    if (activeDownloads_.isEmpty() && downloadQueue_.isEmpty()) {
-        downloadBtn_->setText(tr("Download"));
+    if (active_downloads_.empty() && download_queue_.empty()) {
+        window_->set_download_button_text("Download");
+    } else if (download_queue_.empty()) {
+        window_->set_download_button_text("Queue");
     } else {
-        downloadBtn_->setText(downloadQueue_.isEmpty()
-                                  ? tr("Queue")
-                                  : tr("Queue (%1)").arg(downloadQueue_.size()));
+        window_->set_download_button_text(
+            toSlintString("Queue (" + std::to_string(download_queue_.size()) + ")"));
     }
 }
 
-void MainWindow::updateStatsLabel(int lastStatus) {
-    if (!activeDownloads_.isEmpty()) {
-        statsLabel_->setText(tr("%1 download(s) active").arg(activeDownloads_.size()));
-    } else if (!downloadQueue_.isEmpty()) {
-        statsLabel_->setText(tr("Queued"));
-    } else if (lastStatus != -1) {
-        statsLabel_->setText(lastStatus == 0 ? tr("Complete") : tr("Ready"));
-    } else {
-        statsLabel_->setText(tr("Ready"));
-    }
+void MainWindow::openFile(int index) {
+    if (index < 0 || static_cast<std::size_t>(index) >= download_history_.size()) return;
+    const auto &path = download_history_[static_cast<std::size_t>(index)].file_path;
+    std::error_code error;
+    if (!path.empty() && std::filesystem::is_regular_file(path, error)) openWithSystem(path);
 }
 
-void MainWindow::resizeEvent(QResizeEvent *event) {
-    QMainWindow::resizeEvent(event);
-    if (qualityWidget_ && centralWidget()) {
-        int width = centralWidget()->width() - ResizeMarginOffset;
-        qualityWidget_->setGeometry(LayoutMargins, qualityWidget_->geometry().y(), width, qualityWidget_->height());
-    }
+void MainWindow::openFolder(int index) {
+    if (index < 0 || static_cast<std::size_t>(index) >= download_history_.size()) return;
+    const auto &path = download_history_[static_cast<std::size_t>(index)].file_path;
+    if (!path.empty()) openWithSystem(path.parent_path());
 }
 
-QString MainWindow::formatFileSize(qint64 bytes) {
+void MainWindow::removeItem(int index) {
+    if (index < 0 || static_cast<std::size_t>(index) >= download_history_.size()) return;
+    auto &info = download_history_[static_cast<std::size_t>(index)];
+    if (info.status == 1) return;
+    if (info.status == 0) {
+        download_queue_.erase(std::remove(download_queue_.begin(), download_queue_.end(), info.id),
+                              download_queue_.end());
+    }
+    download_history_.erase(download_history_.begin() + index);
+    refreshHistory();
+    updateDownloadButton();
+    refreshStatus();
+}
+
+std::string MainWindow::formatFileSize(std::int64_t bytes) {
     if (bytes <= 0) return "0 B";
-
     constexpr std::array<const char *, 5> units = {"B", "KB", "MB", "GB", "TB"};
-    int unit = 0;
+    std::size_t unit = 0;
     double size = static_cast<double>(bytes);
-
-    while (size >= SpeedThreshold && unit < 4) {
-        size /= SpeedThreshold;
-        unit++;
+    while (size >= SizeThreshold && unit < 4) {
+        size /= SizeThreshold;
+        ++unit;
     }
-
-    return QString("%1 %2").arg(QString::number(size, 'f', unit == 0 ? 0 : 1)).arg(units[unit]);
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(unit == 0 ? 0 : 1) << size << ' ' << units[unit];
+    return output.str();
 }
 
-QString MainWindow::formatDuration(int seconds) {
-    if (seconds < 60) return QString("%1s").arg(seconds);
+std::string MainWindow::formatDuration(int seconds) {
+    if (seconds < 60) return std::to_string(seconds) + "s";
     if (seconds < 3600) {
-        return QString("%1m %2s").arg(seconds / 60).arg(seconds % 60);
+        return std::to_string(seconds / 60) + "m " + std::to_string(seconds % 60) + "s";
     }
-    return QString("%1h %2m").arg(seconds / 3600).arg((seconds % 3600) / 60);
+    return std::to_string(seconds / 3600) + "h " +
+        std::to_string((seconds % 3600) / 60) + "m";
 }
-
-void MainWindow::closeEvent(QCloseEvent *event) {
-    const auto downloads = activeDownloads_.keys();
-    for (DownloadThread *download : downloads) {
-        download->cancel();
-    }
-    event->accept();
-    qApp->quit();
-}
-
-

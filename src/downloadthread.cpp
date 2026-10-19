@@ -1,196 +1,390 @@
 #include "downloadthread.h"
+
+#include <algorithm>
 #include <array>
-#include <QDir>
-#include <QFile>
-#include <QFileInfo>
-#include <QProcess>
-#include <QRegularExpression>
-#include <QStringList>
+#include <chrono>
+#include <cctype>
+#include <regex>
+#include <string_view>
+#include <utility>
+#include <vector>
+
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#else
+#include <cerrno>
+#include <csignal>
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+extern char **environ;
+#endif
 
 namespace {
-    constexpr auto TitleOutputPrefix = "__YT2OGG_TITLE__";
-    constexpr int StartWaitTimeoutMs = 5000;
-    constexpr int ReadWaitIntervalMs = 100;
-    constexpr int Gigabytes = 1073741824;
-    constexpr int Megabytes = 1048576;
-    constexpr int Kilobytes = 1024;
+constexpr std::string_view TitleOutputPrefix = "__YT2OGG_TITLE__";
+constexpr std::string_view FileOutputPrefix = "__YT2OGG_FILE__";
+
+std::string pathToUtf8(const std::filesystem::path &path) {
+    const auto encoded = path.u8string();
+    return std::string(reinterpret_cast<const char *>(encoded.data()), encoded.size());
 }
 
-DownloadThread::DownloadThread(QObject *parent)
-    : QThread(parent)
-    , cancelled_(false)
-{
+std::filesystem::path pathFromUtf8(std::string_view value) {
+#ifdef _WIN32
+    std::u8string encoded;
+    encoded.reserve(value.size());
+    for (unsigned char character : value) encoded.push_back(static_cast<char8_t>(character));
+    return std::filesystem::path(encoded);
+#else
+    return std::filesystem::path(value);
+#endif
 }
+
+std::int64_t bytesFromUnit(double value, const std::string &unit) {
+    const double multiplier = unit.find('G') != std::string::npos ? 1073741824.0 :
+        unit.find('M') != std::string::npos ? 1048576.0 :
+        unit.find('K') != std::string::npos ? 1024.0 : 1.0;
+    return static_cast<std::int64_t>(value * multiplier);
+}
+
+#ifdef _WIN32
+std::wstring toWide(const std::string &value) {
+    const int size = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
+    if (size <= 0) return {};
+    std::wstring result(static_cast<size_t>(size), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, result.data(), size);
+    result.resize(static_cast<size_t>(size - 1));
+    return result;
+}
+
+std::string quoteWindowsArgument(const std::wstring &argument) {
+    std::wstring quoted = L"\"";
+    size_t slashes = 0;
+    for (wchar_t character : argument) {
+        if (character == L'\\') {
+            ++slashes;
+        } else if (character == L'"') {
+            quoted.append(slashes * 2 + 1, L'\\');
+            quoted.push_back(character);
+            slashes = 0;
+        } else {
+            quoted.append(slashes, L'\\');
+            slashes = 0;
+            quoted.push_back(character);
+        }
+    }
+    quoted.append(slashes * 2, L'\\');
+    quoted.push_back(L'"');
+    const int size = WideCharToMultiByte(CP_UTF8, 0, quoted.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    std::string result(static_cast<size_t>(size), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, quoted.c_str(), -1, result.data(), size, nullptr, nullptr);
+    result.resize(static_cast<size_t>(size - 1));
+    return result;
+}
+
+bool runProcess(const std::vector<std::string> &arguments, std::atomic_bool &cancelled,
+                const std::function<void(const std::string &)> &on_line, int &exit_code) {
+    std::wstring command_line;
+    for (const std::string &argument : arguments) {
+        if (!command_line.empty()) command_line.push_back(L' ');
+        command_line += toWide(quoteWindowsArgument(toWide(argument)));
+    }
+
+    SECURITY_ATTRIBUTES security{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+    HANDLE read_pipe = nullptr;
+    HANDLE write_pipe = nullptr;
+    if (!CreatePipe(&read_pipe, &write_pipe, &security, 0)) return false;
+    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdOutput = write_pipe;
+    startup.hStdError = write_pipe;
+    startup.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    PROCESS_INFORMATION process{};
+    const std::wstring executable = toWide(arguments.front());
+    const BOOL started = CreateProcessW(executable.c_str(), command_line.data(), nullptr, nullptr,
+                                        TRUE, CREATE_NO_WINDOW, nullptr, nullptr, &startup, &process);
+    CloseHandle(write_pipe);
+    if (!started) {
+        CloseHandle(read_pipe);
+        return false;
+    }
+
+    std::string buffered;
+    std::array<char, 4096> bytes{};
+    const auto append_bytes = [&buffered, &on_line](const char *data, size_t size) {
+        buffered.append(data, size);
+        size_t newline;
+        while ((newline = buffered.find('\n')) != std::string::npos) {
+            on_line(buffered.substr(0, newline));
+            buffered.erase(0, newline + 1);
+        }
+    };
+    bool pipe_open = true;
+    while (pipe_open) {
+        if (cancelled.load()) {
+            TerminateProcess(process.hProcess, 1);
+        }
+        DWORD available = 0;
+        if (!PeekNamedPipe(read_pipe, nullptr, 0, nullptr, &available, nullptr)) {
+            pipe_open = false;
+        } else if (available > 0) {
+            DWORD read = 0;
+            if (ReadFile(read_pipe, bytes.data(),
+                         std::min<DWORD>(available, static_cast<DWORD>(bytes.size())),
+                         &read, nullptr) && read > 0) {
+                append_bytes(bytes.data(), read);
+            }
+        } else if (WaitForSingleObject(process.hProcess, 50) == WAIT_OBJECT_0) {
+            DWORD read = 0;
+            if (!ReadFile(read_pipe, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) || read == 0) {
+                pipe_open = false;
+            } else {
+                append_bytes(bytes.data(), read);
+            }
+        } else {
+            Sleep(50);
+        }
+    }
+    if (!buffered.empty()) on_line(buffered);
+    WaitForSingleObject(process.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(process.hProcess, &code);
+    exit_code = static_cast<int>(code);
+    CloseHandle(read_pipe);
+    CloseHandle(process.hThread);
+    CloseHandle(process.hProcess);
+    return true;
+}
+#else
+bool runProcess(const std::vector<std::string> &arguments, std::atomic_bool &cancelled,
+                const std::function<void(const std::string &)> &on_line, int &exit_code) {
+    int output_pipe[2];
+    if (pipe(output_pipe) != 0) return false;
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        return false;
+    }
+    posix_spawn_file_actions_adddup2(&actions, output_pipe[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, output_pipe[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, output_pipe[0]);
+    posix_spawn_file_actions_addclose(&actions, output_pipe[1]);
+    std::vector<char *> argv;
+    argv.reserve(arguments.size() + 1);
+    for (const std::string &argument : arguments) {
+        argv.push_back(const_cast<char *>(argument.c_str()));
+    }
+    argv.push_back(nullptr);
+    pid_t child = -1;
+    const int spawn_status = posix_spawnp(&child, argv.front(), &actions, nullptr,
+                                          argv.data(), environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (spawn_status != 0) {
+        close(output_pipe[0]);
+        close(output_pipe[1]);
+        return false;
+    }
+
+    close(output_pipe[1]);
+    const int flags = fcntl(output_pipe[0], F_GETFL, 0);
+    if (flags >= 0) fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK);
+    std::string buffered;
+    std::array<char, 4096> bytes{};
+    const auto append_bytes = [&buffered, &on_line](const char *data, size_t size) {
+        buffered.append(data, size);
+        size_t newline;
+        while ((newline = buffered.find('\n')) != std::string::npos) {
+            on_line(buffered.substr(0, newline));
+            buffered.erase(0, newline + 1);
+        }
+    };
+    bool child_exited = false;
+    bool sent_termination = false;
+    auto termination_time = std::chrono::steady_clock::time_point{};
+
+    while (!child_exited) {
+        if (cancelled.load() && !sent_termination) {
+            kill(child, SIGTERM);
+            sent_termination = true;
+            termination_time = std::chrono::steady_clock::now();
+        }
+        if (sent_termination &&
+            std::chrono::steady_clock::now() - termination_time > std::chrono::seconds(2)) {
+            kill(child, SIGKILL);
+        }
+
+        pollfd descriptor{output_pipe[0], POLLIN | POLLHUP, 0};
+        poll(&descriptor, 1, 100);
+        if (descriptor.revents & (POLLIN | POLLHUP)) {
+            ssize_t count;
+            while ((count = read(output_pipe[0], bytes.data(), bytes.size())) > 0) {
+                append_bytes(bytes.data(), static_cast<size_t>(count));
+            }
+        }
+        int status = 0;
+        if (waitpid(child, &status, WNOHANG) == child) {
+            child_exited = true;
+            exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+    }
+    ssize_t count;
+    while ((count = read(output_pipe[0], bytes.data(), bytes.size())) > 0) {
+        append_bytes(bytes.data(), static_cast<size_t>(count));
+    }
+    if (!buffered.empty()) on_line(buffered);
+    close(output_pipe[0]);
+    return true;
+}
+#endif
+}
+
+DownloadThread::DownloadThread(std::string url, std::filesystem::path output_directory,
+                               std::filesystem::path ytdlp_path, int quality,
+                               Callbacks callbacks)
+    : url_(std::move(url)),
+      output_directory_(std::move(output_directory)),
+      ytdlp_path_(std::move(ytdlp_path)),
+      quality_(std::clamp(quality, 0, 3)),
+      callbacks_(std::move(callbacks)) {}
 
 DownloadThread::~DownloadThread() {
-    if (isRunning()) {
-        cancel();
-        wait();
-    }
+    cancel();
+    join();
 }
 
-void DownloadThread::startDownload(const QString &url, const QString &outputDir,
-                                   const QString &ytDlpPath, int quality) {
-    url_ = url;
-    outputDir_ = outputDir;
-    ytDlpPath_ = ytDlpPath;
-    quality_ = qBound(0, quality, 3);
-    cancelled_.store(false);
-    outputFilePath_.clear();
-
-    start();
+void DownloadThread::start() {
+    thread_ = std::thread(&DownloadThread::run, this);
 }
 
 void DownloadThread::cancel() {
     cancelled_.store(true);
 }
 
+void DownloadThread::join() {
+    if (thread_.joinable()) thread_.join();
+}
+
 void DownloadThread::run() {
-    QProcess process;
-
-    QStringList args;
-    args << "--no-playlist"
-         << "--newline"
-         << "--progress"
-         << "--no-simulate"
-         << "--print" << "after_move:filepath"
-         << "--print" << QString("before_dl:%1%(title)s").arg(TitleOutputPrefix)
-         << "--no-quiet"
-         << "-f" << "bestaudio[acodec=opus]"
-         << "-x"
-         << "--audio-format" << "opus";
-
-    constexpr std::array<const char *, 3> qualityBitrates = {"96K", "80K", "64K"};
+    std::vector<std::string> arguments{
+        pathToUtf8(ytdlp_path_),
+        "--no-playlist", "--newline", "--progress", "--no-simulate", "--color", "never",
+        "--print", "after_move:__YT2OGG_FILE__%(filepath)s",
+        "--print", "before_dl:__YT2OGG_TITLE__%(title)s",
+        "--no-quiet", "-f", "bestaudio[acodec=opus]", "-x",
+        "--audio-format", "opus"
+    };
+    constexpr std::array<const char *, 3> quality_bitrates = {"96K", "80K", "64K"};
     if (quality_ > 0) {
-        const QString bitrate = QString::fromLatin1(qualityBitrates[quality_ - 1]);
-        args << "--audio-quality" << bitrate
-             << "--postprocessor-args"
-             << QString("ExtractAudio+ffmpeg_o:-c:a libopus -b:a %1").arg(bitrate);
+        const std::string bitrate = quality_bitrates[quality_ - 1];
+        arguments.insert(arguments.end(), {
+            "--audio-quality", bitrate, "--postprocessor-args",
+            "ExtractAudio+ffmpeg_o:-c:a libopus -b:a " + bitrate
+        });
     }
+    arguments.insert(arguments.end(), {
+        "-o", pathToUtf8(output_directory_ / "%(title)s.%(ext)s"), "--", url_
+    });
 
-    args << "-o" << QString("%1/%(title)s.%(ext)s").arg(outputDir_)
-         << "--" << url_;
-
-    process.setProcessChannelMode(QProcess::MergedChannels);
-    process.start(ytDlpPath_, args);
-
-    if (!process.waitForStarted(StartWaitTimeoutMs)) {
-        emit finished(-1, QString());
+    int exit_code = -1;
+    const bool started = runProcess(arguments, cancelled_,
+                                    [this](const std::string &line) { processLine(line); },
+                                    exit_code);
+    if (!started) {
+        finish(-1);
         return;
     }
-
-    while (process.state() != QProcess::NotRunning) {
-        process.waitForReadyRead(ReadWaitIntervalMs);
-        onReadyReadStandardOutput(&process);
-    }
-    onReadyReadStandardOutput(&process);
-    onFinished(&process, process.exitCode(), process.exitStatus());
-}
-
-void DownloadThread::onReadyReadStandardOutput(QProcess *process) {
-    while (process->canReadLine()) {
-        QString line = QString::fromUtf8(process->readLine()).trimmed();
-        if (line.isEmpty()) {
-            continue;
-        }
-
-        if (cancelled_.load()) {
-            process->kill();
-            return;
-        }
-
-        if (parseProgressLine(line)) {
-            continue;
-        }
-
-        if (line.startsWith(TitleOutputPrefix)) {
-            emit titleFound(line.mid(QString::fromLatin1(TitleOutputPrefix).size()));
-            continue;
-        }
-
-        if (line.contains("[ExtractAudio]", Qt::CaseInsensitive)) {
-            emit statusChanged(tr("Encoding"));
-        }
-
-        const QFileInfo printedFile(line);
-        if (printedFile.suffix().compare("opus", Qt::CaseInsensitive) == 0 &&
-            printedFile.isFile()) {
-            outputFilePath_ = printedFile.absoluteFilePath();
-        }
-    }
-}
-
-void DownloadThread::onFinished(QProcess *process, int exitCode, QProcess::ExitStatus exitStatus) {
     if (cancelled_.load()) {
-        emit finished(-2, QString());
+        finish(-2);
+        return;
+    }
+    if (exit_code != 0) {
+        finish(-3);
         return;
     }
 
-    if (exitStatus != QProcess::NormalExit || exitCode != 0) {
-        emit finished(-3, QString());
+    std::error_code error;
+    if (output_file_path_.empty() || !std::filesystem::is_regular_file(output_file_path_, error)) {
+        finish(-4);
         return;
     }
-    const QFileInfo opusFile(outputFilePath_);
-    if (opusFile.exists()) {
-        QString oggPath = opusFile.dir().filePath(opusFile.completeBaseName() + ".ogg");
-        if (QFileInfo::exists(oggPath)) {
-            int suffix = 1;
-            do {
-                oggPath = opusFile.dir().filePath(
-                    QString("%1 (%2).ogg").arg(opusFile.completeBaseName()).arg(suffix++));
-            } while (QFileInfo::exists(oggPath));
-        }
-        if (!QFile::rename(opusFile.absoluteFilePath(), oggPath)) {
-            emit finished(-4, QString());
-            return;
-        }
-        emit finished(0, oggPath);
-    } else {
-        emit finished(-4, QString());
+
+    if (output_file_path_.extension() == ".ogg") {
+        finish(0, output_file_path_);
+        return;
     }
+
+    std::filesystem::path ogg_path = output_file_path_;
+    ogg_path.replace_extension(".ogg");
+    const auto output_stem = output_file_path_.parent_path() / output_file_path_.stem();
+    if (std::filesystem::exists(ogg_path, error)) {
+        int suffix = 1;
+        do {
+            ogg_path = output_stem;
+            ogg_path += " (" + std::to_string(suffix++) + ").ogg";
+            error.clear();
+        } while (std::filesystem::exists(ogg_path, error));
+    }
+    error.clear();
+    std::filesystem::rename(output_file_path_, ogg_path, error);
+    if (error) {
+        finish(-4);
+        return;
+    }
+    finish(0, ogg_path);
 }
 
-auto DownloadThread::parseProgressLine(const QString &line) -> bool {
-    QRegularExpression regex(
+void DownloadThread::processLine(const std::string &line) {
+    if (!line.empty() && line.back() == '\r') {
+        processLine(line.substr(0, line.size() - 1));
+        return;
+    }
+    if (parseProgressLine(line)) return;
+    if (line.starts_with(TitleOutputPrefix)) {
+        if (callbacks_.title_found) callbacks_.title_found(line.substr(TitleOutputPrefix.size()));
+        return;
+    }
+    if (line.starts_with(FileOutputPrefix)) {
+        const auto printed_file = pathFromUtf8(line.substr(FileOutputPrefix.size()));
+        const auto resolved_path = printed_file.is_absolute()
+            ? printed_file : output_directory_ / printed_file;
+        output_file_path_ = std::filesystem::absolute(resolved_path);
+        return;
+    }
+    std::string lowercase = line;
+    std::transform(lowercase.begin(), lowercase.end(), lowercase.begin(),
+                   [](unsigned char character) { return static_cast<char>(std::tolower(character)); });
+    if (lowercase.find("[extractaudio]") != std::string::npos && callbacks_.status_changed) {
+        callbacks_.status_changed("Encoding");
+    }
+
+}
+
+bool DownloadThread::parseProgressLine(const std::string &line) {
+    static const std::regex progress_regex(
         R"(\[download\]\s+(\d+\.?\d*)%\s+of\s+([\d.]+)([KMGT]?i?B?)\s+at\s+([\d.]+)([KMGT]?i?B?/s)\s+ETA\s+(?:\d+:\d+|0:00))");
-    QRegularExpressionMatch match = regex.match(line);
+    std::smatch match;
+    if (!std::regex_search(line, match, progress_regex)) return false;
 
-    if (!match.hasMatch()) {
-        return false;
+    const double percent = std::stod(match[1].str());
+    const auto total = bytesFromUnit(std::stod(match[2].str()), match[3].str());
+    const auto speed = bytesFromUnit(std::stod(match[4].str()), match[5].str());
+    if (callbacks_.progress) {
+        callbacks_.progress(static_cast<std::int64_t>(static_cast<double>(total) * percent / 100.0),
+                            total);
     }
-
-    double percent = match.captured(1).toDouble();
-
-    double totalVal = match.captured(2).toDouble();
-    QString totalUnit = match.captured(3).toUpper();
-    qint64 totalBytes = 0;
-    if (totalUnit.contains("G")) {
-        totalBytes = static_cast<qint64>(totalVal * Gigabytes);
-    } else if (totalUnit.contains("M")) {
-        totalBytes = static_cast<qint64>(totalVal * Megabytes);
-    } else if (totalUnit.contains("K")) {
-        totalBytes = static_cast<qint64>(totalVal * Kilobytes);
-    } else {
-        totalBytes = static_cast<qint64>(totalVal);
-    }
-
-    double speedVal = match.captured(4).toDouble();
-    QString speedUnit = match.captured(5).toUpper();
-    qint64 speedBytes = 0;
-    if (speedUnit.contains("G")) {
-        speedBytes = static_cast<qint64>(speedVal * Gigabytes);
-    } else if (speedUnit.contains("M")) {
-        speedBytes = static_cast<qint64>(speedVal * Megabytes);
-    } else if (speedUnit.contains("K")) {
-        speedBytes = static_cast<qint64>(speedVal * Kilobytes);
-    } else {
-        speedBytes = static_cast<qint64>(speedVal);
-    }
-
-    auto receivedBytes = static_cast<qint64>(static_cast<double>(totalBytes) * percent / 100.0);
-
-    emit progress(receivedBytes, totalBytes);
-    emit speedChanged(speedBytes);
-
+    if (callbacks_.speed_changed) callbacks_.speed_changed(speed);
     return true;
+}
+
+void DownloadThread::finish(int status, const std::filesystem::path &path) {
+    if (callbacks_.finished) callbacks_.finished(status, path);
 }

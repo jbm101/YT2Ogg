@@ -1,49 +1,50 @@
 #ifndef DOWNLOADTHREAD_H
 #define DOWNLOADTHREAD_H
 
-#include <QObject>
-#include <QProcess>
-#include <QString>
-#include <QThread>
 #include <atomic>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <string>
+#include <thread>
 
-class DownloadThread : public QThread {
-    Q_OBJECT
-
+class DownloadThread {
 public:
-    explicit DownloadThread(QObject *parent = nullptr);
-    ~DownloadThread() override;
+    struct Callbacks {
+        std::function<void(std::int64_t, std::int64_t)> progress;
+        std::function<void(std::int64_t)> speed_changed;
+        std::function<void(const std::string &)> status_changed;
+        std::function<void(const std::string &)> title_found;
+        std::function<void(int, const std::filesystem::path &)> finished;
+    };
 
-    DownloadThread(DownloadThread &&) = delete;
-    DownloadThread &operator=(DownloadThread &&) = delete;
+    DownloadThread(std::string url, std::filesystem::path output_directory,
+                   std::filesystem::path ytdlp_path, int quality, Callbacks callbacks);
+    ~DownloadThread();
 
     DownloadThread(const DownloadThread &) = delete;
     DownloadThread &operator=(const DownloadThread &) = delete;
+    DownloadThread(DownloadThread &&) = delete;
+    DownloadThread &operator=(DownloadThread &&) = delete;
 
-    void startDownload(const QString &url, const QString &outputDir,
-                       const QString &ytDlpPath, int quality);
+    void start();
     void cancel();
-
-    void run() override;
-
-signals:
-    void progress(qint64 received, qint64 total);
-    void speedChanged(qint64 bytesPerSecond);
-    void statusChanged(const QString &status);
-    void titleFound(const QString &title);
-    void finished(int status, const QString &filePath);
+    void join();
 
 private:
-    void onReadyReadStandardOutput(QProcess *process);
-    void onFinished(QProcess *process, int exitCode, QProcess::ExitStatus exitStatus);
-    bool parseProgressLine(const QString &line);
+    void run();
+    void processLine(const std::string &line);
+    bool parseProgressLine(const std::string &line);
+    void finish(int status, const std::filesystem::path &path = {});
 
-    QString url_;
-    QString outputDir_;
-    QString ytDlpPath_;
+    std::string url_;
+    std::filesystem::path output_directory_;
+    std::filesystem::path ytdlp_path_;
     int quality_ = 0;
-    QString outputFilePath_;
-    std::atomic_bool cancelled_;
+    Callbacks callbacks_;
+    std::atomic_bool cancelled_{false};
+    std::thread thread_;
+    std::filesystem::path output_file_path_;
 };
 
-#endif // DOWNLOADTHREAD_H
+#endif

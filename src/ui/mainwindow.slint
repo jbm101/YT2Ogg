@@ -1,0 +1,266 @@
+import { Button, LineEdit, ListView, Palette, Slider } from "std-widgets.slint";
+
+export struct DownloadItem {
+    title: string,
+    status: string,
+    size: string,
+    speed: string,
+    file_path: string,
+    status_code: int,
+}
+
+export component MainWindowUI inherits Window {
+    title: "YT2Ogg";
+    width: 750px;
+    height: 600px;
+    background: Palette.background;
+
+    init => { Palette.color-scheme = ColorScheme.dark; }
+
+    in-out property <string> url;
+    in-out property <string> output-directory;
+    in-out property <int> quality: 0;
+    in-out property <string> status-text: "Ready";
+    in-out property <string> download-button-text: "Download";
+    in property <[DownloadItem]> history;
+
+    callback download-requested(string);
+    callback choose-output-directory();
+    callback quality-changed(int);
+    callback open-project-link();
+    callback open-file(int);
+    callback open-folder(int);
+    callback remove-item(int);
+    callback clear-history();
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        Rectangle {
+            background: Palette.control-background;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Palette.border;
+            height: 116px;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        text <=> root.url;
+                        placeholder-text: "Paste a YouTube URL...";
+                        accepted(text) => { root.download-requested(text); }
+                    }
+                    Button {
+                        text: root.download-button-text;
+                        clicked => { root.download-requested(root.url); }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text {
+                        text: "Output folder";
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                        width: 94px;
+                    }
+                    Text {
+                        text: root.output-directory;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "Browse...";
+                        clicked => { root.choose-output-directory(); }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            background: Palette.control-background;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Palette.border;
+            height: 96px;
+
+            VerticalLayout {
+                padding: 10px;
+                spacing: 4px;
+
+                HorizontalLayout {
+                    Text {
+                        text: "Audio quality";
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Text {
+                        text: ["Source", "96 kbps", "80 kbps", "64 kbps"][root.quality];
+                        color: Palette.accent-background;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                    }
+                }
+                quality-slider := Slider {
+                    minimum: 0;
+                    maximum: 3;
+                    step: 1;
+                    value: root.quality;
+                    changed(value) => {
+                        root.quality = round(value);
+                        quality-slider.value = root.quality;
+                        root.quality-changed(root.quality);
+                    }
+                }
+                HorizontalLayout {
+                    Text {
+                        text: "Source";
+                        color: Palette.foreground;
+                        horizontal-alignment: left;
+                        horizontal-stretch: 0.5;
+                    }
+                    Text {
+                        text: "96 kbps";
+                        color: Palette.foreground;
+                        horizontal-alignment: center;
+                        horizontal-stretch: 2.1;
+                    }
+                    Text {
+                        text: "80 kbps";
+                        color: Palette.foreground;
+                        horizontal-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: "64 kbps";
+                        color: Palette.foreground;
+                        horizontal-alignment: right;
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            background: Palette.control-background;
+            border-radius: 8px;
+            border-width: 1px;
+            border-color: Palette.border;
+            vertical-stretch: 1;
+
+            VerticalLayout {
+                padding: 12px;
+                spacing: 8px;
+
+                HorizontalLayout {
+                    Text {
+                        text: "Download history";
+                        font-size: 16px;
+                        font-weight: 600;
+                        color: Palette.foreground;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Clear All";
+                        clicked => { root.clear-history(); }
+                    }
+                }
+
+                Rectangle {
+                    background: Palette.alternate-background;
+                    border-radius: 4px;
+                    height: 28px;
+                    HorizontalLayout {
+                        padding: 4px;
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        Text { text: "Title"; color: Palette.foreground; horizontal-stretch: 1; }
+                        Text { text: "Status"; color: Palette.foreground; width: 106px; }
+                        Text { text: "Size"; color: Palette.foreground; width: 102px; }
+                        Text { text: "Speed / time"; color: Palette.foreground; width: 94px; }
+                        Rectangle { width: 142px; }
+                    }
+                }
+
+                ListView {
+                    vertical-stretch: 1;
+                    for item[index] in root.history: Rectangle {
+                        background: Math.mod(index, 2) == 0
+                            ? Palette.control-background : Palette.alternate-background;
+                        border-width: 0px;
+                        height: 38px;
+
+                        HorizontalLayout {
+                            padding: 4px;
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            spacing: 4px;
+                            Text {
+                                text: item.title;
+                                color: Palette.foreground;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                            Text {
+                                text: item.status;
+                                color: Palette.foreground;
+                                vertical-alignment: center;
+                                width: 106px;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: item.size;
+                                color: Palette.foreground;
+                                vertical-alignment: center;
+                                width: 102px;
+                            }
+                            Text {
+                                text: item.speed;
+                                color: Palette.foreground;
+                                vertical-alignment: center;
+                                width: 94px;
+                            }
+                            Button {
+                                text: "Open";
+                                enabled: item.file_path != "";
+                                clicked => { root.open-file(index); }
+                            }
+                            Button {
+                                text: "Folder";
+                                enabled: item.file_path != "";
+                                clicked => { root.open-folder(index); }
+                            }
+                            Button {
+                                text: "Remove";
+                                enabled: item.status_code != 1;
+                                clicked => { root.remove-item(index); }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Text {
+            text: root.status-text;
+            color: Palette.foreground;
+            horizontal-alignment: center;
+            height: 20px;
+        }
+
+        Button {
+            text: "GitHub: github.com/jbm101/YT2Ogg";
+            clicked => { root.open-project-link(); }
+        }
+    }
+}
