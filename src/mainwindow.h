@@ -19,14 +19,12 @@
 #include <QPushButton>
 #include <QSettings>
 #include <QSlider>
-#include <QSystemTrayIcon>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QVBoxLayout>
 #include <QVector>
 
 #include "downloadthread.h"
-#include "ytdlmanager.h"
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -48,14 +46,12 @@ private slots:
     void onRemoveItem(QTableWidgetItem *item);
     void onClearAll();
     void onOpenDownloadFolder();
-    void onTrayActivated(QSystemTrayIcon::ActivationReason reason);
     void processDownloadQueue();
 
     void closeEvent(QCloseEvent *event) override;
 
 private:
     void setupUI();
-    void setupTrayIcon();
     void loadSettings();
     void saveSettings();
     [[nodiscard]] QString getOutputDir() const;
@@ -72,6 +68,7 @@ private:
     static QString formatFileSize(qint64 bytes);
     static QString formatDuration(int seconds);
 
+
 protected:
     void resizeEvent(QResizeEvent *event) override;
 
@@ -86,15 +83,13 @@ protected:
     QTableWidget *historyTable_ = nullptr;
 
     // State
-    YtDlManager *ytDlManager_ = nullptr;
-    QSystemTrayIcon *trayIcon_ = nullptr;
     QWidget *qualityWidget_ = nullptr;
     QSettings *settings_ = nullptr;
     QHash<DownloadThread *, quint64> activeDownloads_;
     QVector<quint64> downloadQueue_;
     quint64 nextDownloadId_ = 1;
 
-    void showStartupDialog();
+
     struct DownloadInfo {
         quint64 id = 0;
         QString url;

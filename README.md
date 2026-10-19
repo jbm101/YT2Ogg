@@ -2,25 +2,23 @@
 
 Download YouTube videos as **Opus audio (.ogg)** with a clean, cross-platform Qt6 GUI.
 
-Uses an installed [yt-dlp](https://github.com/yt-dlp/yt-dlp) when available; otherwise downloads it automatically from GitHub.
+Requires [yt-dlp](https://github.com/yt-dlp/yt-dlp) to be installed and available in your system PATH or next to the executable.
 
 ## Features
 
 - **Direct Opus download** — Keeps the original Opus stream by default, without re-encoding
 - **Cross-platform** — Works on Windows, Linux (glibc), and macOS
-- **System package support** — Uses yt-dlp from your system PATH when installed
-- **Auto-downloads yt-dlp** — Fetches the latest yt-dlp from GitHub automatically on first run; falls back to a hardcoded version if the GitHub API is unreachable
-- **Clean Qt6 GUI** — Modern, responsive interface with download history and Fusion style for consistent cross-platform appearance
+- **System package support** — Uses yt-dlp from your system PATH or next to the executable
+- **Clean Qt6 GUI — Modern, responsive interface with download history and Fusion style for consistent cross-platform appearance
 - **Concurrent downloads** — Up to three simultaneous downloads; additional URLs are queued automatically
 - **Configurable quality** — Keep the source Opus stream, or re-encode at 96, 80, or 64 kbps via a slider with live labels
-- **System tray** — Minimize to tray; click the tray icon to quickly restore the window and focus the URL input
 - **Lean & optimized** — Stripped binaries, link-time optimization, dead code elimination
 
 ## Setup
 
 ### First Run
 
-If yt-dlp is not found in your system PATH or next to the executable, a **setup dialog** appears automatically. It downloads the latest yt-dlp from GitHub with a progress indicator and verifies the binary is functional before letting you proceed. You can cancel the download and the application will exit.
+YT2Ogg checks for yt-dlp in the same directory as the executable, then in your system PATH. If not found, a setup dialog appears with a link to download yt-dlp.
 
 ### Build-time Requirements
 
@@ -101,8 +99,6 @@ The history table shows all downloads with four columns:
 
 - **Double-click** a completed download to open the file in your system file manager
 - **Right-click** for a context menu: `Open File`, `Open Containing Folder`, `Remove`
-- Active downloads **cannot be removed** from the history via the context menu
-- **Clear All** removes all completed/cancelled entries and empties the queue
 
 ### Quality Slider
 
@@ -164,31 +160,13 @@ Downloads use numeric status codes for precise error tracking:
 | Linux | Static RPATH (`$ORIGIN`) for bundled yt-dlp |
 | macOS | Universal binary support (arm64 + x86_64) |
 
-### Close Behavior
+## Source Files
 
-Closing the window **cancels all active downloads** and quits the application. The system tray icon provides a quick "Open" option to restore the window.
-
-## Project Structure
-
-```
-YT2Ogg/
-├── xmake.lua            # Build configuration
-├── src/
-│   ├── main.cpp         # Application entry point
-│   ├── mainwindow.h     # Main window header
-│   ├── mainwindow.cpp   # Main window implementation (UI, history, queue)
-│   ├── downloadthread.h # yt-dlp worker thread
-│   ├── downloadthread.cpp # Progress parsing, file renaming
-│   ├── ytdlmanager.h    # Auto-downloader for yt-dlp
-│   └── ytdlmanager.cpp  # GitHub API, download, verification
-└── README.md
-```
-
-The yt-dlp binary is downloaded at first run and stored next to the executable.
-
-## License
-
-MIT
+| File | Description |
+|------|-------------|
+| `src/main.cpp` | Application entry point |
+| `src/mainwindow.h` / `mainwindow.cpp` | Main window UI, history table, download queue, yt-dlp detection |
+| `src/downloadthread.h` / `downloadthread.cpp` | yt-dlp worker thread, progress parsing, file renaming |
 
 ## Credits
 

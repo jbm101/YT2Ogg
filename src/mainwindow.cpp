@@ -4,8 +4,10 @@
 #include <QApplication>
 #include <QClipboard>
 #include <QCloseEvent>
+#include <QCoreApplication>
 #include <QDesktopServices>
 #include <QFileDialog>
+#include <QFile>
 #include <QGroupBox>
 #include <QHeaderView>
 #include <QHBoxLayout>
@@ -19,6 +21,7 @@
 #include <QSlider>
 #include <QStandardPaths>
 #include <QStyle>
+#include <QSysInfo>
 #include <QTimer>
 
 namespace {
@@ -55,18 +58,11 @@ MainWindow::MainWindow(QWidget *parent)
     settings_ = new QSettings("YT2Ogg", "YT2Ogg", this);
 
     setupUI();
-    setupTrayIcon();
     loadSettings();
 
     setWindowTitle(tr("YT2Ogg - YouTube to Opus"));
     setMinimumSize(WindowMinWidth, WindowMinHeight);
     resize(WindowInitWidth, WindowInitHeight);
-
-    // Initialize yt-dlp manager
-    ytDlManager_ = new YtDlManager(this);
-
-    // Show startup dialog (downloads yt-dlp if needed)
-    showStartupDialog();
 }
 
 MainWindow::~MainWindow() {
@@ -202,24 +198,6 @@ void MainWindow::setupUI() {
     setCentralWidget(central);
 }
 
-void MainWindow::setupTrayIcon() {
-    trayIcon_ = new QSystemTrayIcon(this);
-    trayIcon_->setIcon(qApp->style()->standardPixmap(QStyle::SP_MediaPlay));
-    trayIcon_->setToolTip("YT2Ogg");
-
-    auto *trayMenu = new QMenu(this);
-    trayMenu->addAction(tr("Open"), this, [this]() { showNormal(); raise(); activateWindow(); });
-    trayMenu->addSeparator();
-    trayMenu->addAction(tr("Open Download Folder"), this, &MainWindow::onOpenDownloadFolder);
-    trayMenu->addSeparator();
-    trayMenu->addAction(tr("Quit"), qApp, &QApplication::quit);
-
-    trayIcon_->setContextMenu(trayMenu);
-    connect(trayIcon_, &QSystemTrayIcon::activated,
-            this, &MainWindow::onTrayActivated);
-    trayIcon_->show();
-}
-
 void MainWindow::loadSettings() {
     // Restore download directory (with default fallback)
     QString downloadDir = settings_->value("downloadDir", "").toString();
@@ -307,7 +285,9 @@ void MainWindow::startDownload(quint64 downloadId) {
 
     updateDownloadButton();
     updateStatsLabel();
-    download->startDownload(info.url, getOutputDir(), ytDlManager_->getYtDlpPath(),
+    QString ytDlpPath = QCoreApplication::applicationDirPath() + "/" +
+                        (QSysInfo::productType() == "windows" ? "yt-dlp.exe" : "yt-dlp");
+    download->startDownload(info.url, getOutputDir(), ytDlpPath,
                             getAudioQuality());
 }
 
@@ -493,15 +473,6 @@ void MainWindow::onOpenDownloadFolder() {
     QDesktopServices::openUrl(QUrl::fromLocalFile(dir));
 }
 
-void MainWindow::onTrayActivated(QSystemTrayIcon::ActivationReason reason) {
-    if (reason == QSystemTrayIcon::Trigger) {
-        showNormal();
-        raise();
-        activateWindow();
-        urlInput_->setFocus();
-    }
-}
-
 quint64 MainWindow::addDownloadItem(const QString &url, const QString &title) {
     QString displayTitle = title;
     if (displayTitle.isEmpty()) {
@@ -592,98 +563,8 @@ void MainWindow::closeEvent(QCloseEvent *event) {
     for (DownloadThread *download : downloads) {
         download->cancel();
     }
-    if (trayIcon_) {
-        trayIcon_->hide();
-    }
     event->accept();
     qApp->quit();
 }
 
-void MainWindow::showStartupDialog() {
-    if (ytDlManager_->checkYtDlpAvailable()) {
-        return;
-    }
 
-    auto *dialog = new QDialog(this);
-    dialog->setWindowTitle(tr("YT2Ogg - Setup"));
-    dialog->setMinimumWidth(DialogWidth);
-    dialog->setFixedHeight(DialogHeight);
-    dialog->setWindowFlags(dialog->windowFlags() & ~Qt::WindowContextHelpButtonHint);
-
-    auto *layout = new QVBoxLayout(dialog);
-    layout->setSpacing(DialogSpacing);
-    layout->setContentsMargins(DialogMarginLeft, DialogMarginTop, DialogMarginRight, DialogMarginBottom);
-
-    // Title
-    auto *titleLabel = new QLabel(tr("Welcome to YT2Ogg"), dialog);
-    titleLabel->setFont(titleLabel->font());
-    layout->addWidget(titleLabel);
-
-    // Description
-    auto *descLabel = new QLabel(
-        tr("YT2Ogg needs yt-dlp to download YouTube videos. "
-           "It will be downloaded automatically now."), dialog);
-    descLabel->setWordWrap(true);
-    layout->addWidget(descLabel);
-
-    // Progress section
-    auto *progressGroup = new QGroupBox(dialog);
-    auto *progressLayout = new QVBoxLayout(progressGroup);
-    progressLayout->setContentsMargins(GroupMargins, GroupMargins, GroupMargins, GroupMargins);
-
-    auto *statusText = new QLabel(tr("Downloading yt-dlp..."), progressGroup);
-    progressLayout->addWidget(statusText);
-
-    auto *progressBar = new QProgressBar(progressGroup);
-    progressBar->setRange(0, ProgressBarMax);
-    progressBar->setValue(0);
-    progressBar->setTextVisible(true);
-    progressBar->setFormat(tr("%p%"));
-    progressLayout->addWidget(progressBar);
-
-    layout->addWidget(progressGroup);
-
-    // Buttons
-    auto *btnLayout = new QHBoxLayout();
-    btnLayout->addStretch();
-
-    auto *cancelBtn = new QPushButton(tr("Cancel"), dialog);
-    cancelBtn->setMinimumWidth(ButtonWidth);
-
-    auto *okBtn = new QPushButton(tr("OK"), dialog);
-    okBtn->setMinimumWidth(ButtonWidth);
-    okBtn->setEnabled(false);
-
-    btnLayout->addWidget(cancelBtn);
-    btnLayout->addWidget(okBtn);
-    layout->addLayout(btnLayout);
-
-    connect(ytDlManager_, &YtDlManager::checkFinished,
-            dialog, [this, progressBar, statusText, okBtn](bool available, const QString &path) {
-        if (available) {
-            progressBar->setValue(ProgressBarMax);
-            statusText->setText(tr("yt-dlp ready! (%1)").arg(QFileInfo(path).fileName()));
-            okBtn->setEnabled(true);
-        } else {
-            statusText->setText(tr("Failed to download yt-dlp."));
-        }
-    });
-
-    connect(ytDlManager_, &YtDlManager::downloadError,
-            dialog, [statusText](const QString &error) {
-        statusText->setText(tr("Error: %1").arg(error));
-    });
-
-    connect(cancelBtn, &QPushButton::clicked, dialog, &QDialog::reject);
-    connect(okBtn, &QPushButton::clicked, dialog, &QDialog::accept);
-
-    ytDlManager_->getYtDlpPath();
-
-    int result = dialog->exec();
-
-    if (result == QDialog::Rejected) {
-        qApp->quit();
-        return;
-    }
-    dialog->deleteLater();
-}
